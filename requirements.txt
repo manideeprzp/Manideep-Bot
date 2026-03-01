@@ -1,0 +1,10 @@
+anthropic>=0.39.0
+PyYAML>=6.0
+slack-bolt>=1.27.0
+slack-sdk>=3.39.0
+rank_bm25>=0.2.2
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+# For AI_PROVIDER=gemini (optional; install if using Gemini instead of Claude)
+google-generativeai>=0.8.0
