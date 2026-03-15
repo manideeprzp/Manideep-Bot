@@ -394,13 +394,16 @@ def run_slack_bot():
             key = _thread_key(event)
             display_id = _parse_work_id(text)
             from . import devrev_client
+            from .enhanced_agent import detect_skill as _detect_skill
             work_id = devrev_client.display_id_to_work_id(display_id) if display_id else None
+            _detected, _conf = _detect_skill(text)
+            _skill = _detected or _parse_skill_name(response) or "none"
             _thread_state[key] = {
                 "step": "suggested",
                 "ticket_text": text,
                 "work_id": work_id,
                 "display_id": display_id,
-                "skill_name": _parse_skill_name(response) or "order-trace-debugger",
+                "skill_name": _skill,
             }
         except Exception as e:
             logger.exception("Agent error")
@@ -712,7 +715,12 @@ def run_slack_bot():
             else:
                 response = result
 
-            skill_name = _parse_skill_name(response) or "order-trace-debugger"
+            # ── Skill detection: keyword match first, then parse LLM response ──
+            # detect_skill() uses pure regex + tag matching — works with or
+            # without an API key, always accurate for known ticket patterns.
+            from .enhanced_agent import detect_skill as _detect_skill
+            detected_skill, confidence = _detect_skill(ticket_text)
+            skill_name = detected_skill or _parse_skill_name(response) or "none"
 
             if ticket_timestamp:
                 save_thread_mapping(ticket_timestamp, bucket_ch, posted_ts)
