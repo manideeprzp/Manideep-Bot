@@ -1,12 +1,88 @@
 # Manideep Bot
 
-Slack bot that **works like you**: uses your **past solved DevRev tickets** and **generated skills** to suggest what to do for tickets. You @mention it, paste a ticket, and it replies with a suggestion and asks for **Yes / No / Proceed**.
+Slack bot that **works like you**: uses your **past solved DevRev tickets** and **skills** to analyze and resolve tickets.
 
-All code and data live in this folder (Desktop/manideep-bot).
+**Two modes:**
+- **🎓 Claude Code Mode** (recommended): You analyze tickets using Claude Code - no API key needed, free, great for learning
+- **🤖 API Mode**: Bot auto-analyzes tickets using Claude API - faster, costs ~$0.01/ticket
+
+**Simple workflow:** New ticket → Bot analyzes → Reply "Yes" → Skill runs → Reply "Approve" → Ticket closed ✅
 
 ---
 
-## Setup
+## 🚀 Quick Start
+
+**5-minute setup:**
+
+```bash
+# 1. Install
+cd ~/Desktop/manideep-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+
+# 2. Set up environment
+cd scripts
+cp .env.example .env
+# Edit .env: add DEVREV_API_KEY, SLACK_BOT_TOKEN, SLACK_APP_TOKEN
+
+# 3. Fetch past tickets
+python3 fetch_my_solved.py
+
+# 4. Run bot + auto-watcher (no API key needed!)
+cd ..
+python -m manideep_bot.app           # Terminal 1
+./scripts/run_auto_watcher.sh        # Terminal 2
+```
+
+**📖 Detailed setup:** See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+
+---
+
+## 🎯 How It Works
+
+### Automatic Mode (Recommended for Development)
+
+1. **New ticket arrives** → Auto-watcher analyzes automatically (5-10 seconds)
+2. **Analysis posted to Slack** with confidence, similar tickets, and skill name
+3. **Reply "Yes"** → Skill runs → Reply **"Approve"** → Ticket closed
+
+**You don't run any manual commands!** Just approve in Slack.
+
+**Benefits:** Free, no API key, fully automatic, great for learning
+
+📖 See [docs/CLAUDE_CODE_INTEGRATION.md](docs/CLAUDE_CODE_INTEGRATION.md)
+
+### API Mode (For Production)
+
+1. Set `ANTHROPIC_API_KEY` in environment
+2. Bot automatically analyzes new tickets
+3. Posts suggestion to Slack
+4. You approve with "Yes" / "Approve"
+
+**Benefits:** Fast, autonomous, scales to many tickets
+
+---
+
+## 📖 Documentation
+
+| Doc | What's Inside |
+|-----|---------------|
+| **[GETTING_STARTED.md](docs/GETTING_STARTED.md)** | **⭐ Start here!** Complete setup guide |
+| [CLAUDE_CODE_INTEGRATION.md](docs/CLAUDE_CODE_INTEGRATION.md) | Claude Code workflow (no API key needed) |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, what runs where |
+| [SKILL_BUILDING_GUIDE.md](docs/SKILL_BUILDING_GUIDE.md) | Build skills for common issue types |
+| [APIS_NEEDED.md](docs/APIS_NEEDED.md) | Which API keys and why |
+| [DEVREV_WORKFLOW_SLACK.md](docs/DEVREV_WORKFLOW_SLACK.md) | DevRev workflow integration |
+| [MONITOR.md](docs/MONITOR.md) | Optional polling monitor |
+| [WEBHOOK.md](docs/WEBHOOK.md) | DevRev webhook setup |
+
+📁 Full docs: [docs/README.md](docs/README.md)
+
+---
+
+## Setup (Detailed)
 
 ### 1. One-time: DevRev data and skills
 
@@ -73,13 +149,27 @@ Config: `config/env.dev.yaml` → `slack.bucket_channel_id`, `bucket.max_tickets
 
 ## Proactive monitor (new tickets + my tickets with new replies)
 
-The bot can **proactively** look at (1) **new tickets** matching your filters and (2) **tickets assigned to you** for **new replies** (e.g. reporter replied on "Awaiting info"). When it finds something, it posts to Slack (via `SLACK_WEBHOOK_URL`).
+A **separate process** continuously checks (1) **new issues** under your filters and (2) **updates** on tickets **assigned to you**. It posts to the **same Slack channel** (and threads) as the bot so you can reply **Yes** / **Approve** there.
 
-- **Config:** `config/env.dev.yaml` → `monitor.enabled`, `monitor.interval_minutes`, `monitor.new_ticket_filters` (e.g. `applies_to_part`), `monitor.my_tickets`.
-- **Run once:** `manideep-bot-monitor` (or `python -m manideep_bot.monitor_cli`).
-- **Run loop:** `manideep-bot-monitor run` (runs every `interval_minutes`). Set `SLACK_WEBHOOK_URL` and `DEVREV_API_KEY` (in `scripts/.env` or env).
+- **Run continuously:** `./run-monitor.sh` or `manideep-bot-monitor run` (polls every `interval_minutes`, default 20).
+- **Run once (test):** `manideep-bot-monitor` or `python -m manideep_bot.monitor_cli once`.
+- **Config:** `config/env.dev.yaml` → `monitor.enabled`, `monitor.interval_minutes`, `monitor.new_ticket_filters`, `monitor.my_tickets`. Set `slack.bucket_channel_id` (or `SLACK_BUCKET_CHANNEL_ID`) so monitor posts to the same channel as the bot.
 
-See **docs/WORKFLOW.md** for the full flow (channels, monitor, two-step approval, skill runner, post to DevRev and close).
+**Full details:** **docs/MONITOR.md** (filters, env overrides, two processes).
+
+Monitor and bucket posts now include **Related past tickets** (links to similar solved issues) so you can compare at a glance.
+
+---
+
+## DevRev webhook (new-issue trigger)
+
+Instead of (or in addition to) polling, you can receive **work_created** events from DevRev via webhook. When a new issue is created, DevRev POSTs to your server; the bot analyzes it and posts to Slack immediately.
+
+- **Run webhook server:** `manideep-bot-webhook` (or `python -m manideep_bot.webhook_cli`). Requires a **public HTTPS URL** (deploy or use ngrok for local dev).
+- **Config:** Set `DEVREV_WEBHOOK_SECRET` (from DevRev when you create the webhook). Optional: `devrev.webhook_secret` and `devrev.app_base_url` in `config/env.dev.yaml`.
+- **Register URL with DevRev:** Run `python3 scripts/register_devrev_webhook.py --url https://YOUR-PUBLIC-URL/webhooks/devrev` (or call `webhooks.create` via curl). See **docs/WEBHOOK.md** for full setup, verification, and testing.
+
+**Recommended (no webhook URL):** Use a **DevRev workflow** that posts new issues to your Slack channel; the bot enters the thread and runs analysis. See **docs/DEVREV_WORKFLOW_SLACK.md** and **docs/ARCHITECTURE.md**.
 
 ---
 
@@ -87,16 +177,35 @@ See **docs/WORKFLOW.md** for the full flow (channels, monitor, two-step approval
 
 ```
 manideep-bot/
-├── config/             # env.dev.yaml (Slack, Anthropic, DevRev, monitor)
-├── template/           # PERSONA.md, SAFETY.md
-├── docs/               # WORKFLOW.md (full spec)
-├── src/manideep_bot/   # app, agent, config, devrev_client, monitor, skill_runner, prompts
-├── scripts/            # DevRev fetch/generate, slack_notify
-├── data/               # my_solved_tickets.json, monitor_state.json
-├── solved/             # Generated skills
+├── .cursor/rules/      # Cursor AI rules (analyze-tickets.md)
+├── config/             # env.dev.yaml (Slack, DevRev, retriever, monitor)
+├── docs/               # ARCHITECTURE, APIS_NEEDED, WEBHOOK, MONITOR, ENHANCED_AGENT, etc.
+├── src/manideep_bot/   # Core bot code
+│   ├── app.py              # Slack bot entry point
+│   ├── agent.py            # Basic AI agent
+│   ├── enhanced_agent.py   # Pattern matching + confidence scoring
+│   ├── claude_code_agent.py # File-based Claude Code analysis
+│   ├── devrev_client.py    # DevRev API client
+│   ├── response_watcher.py # Polls for Claude Code responses
+│   ├── skill_runner.py     # Execute skills
+│   ├── config.py           # Configuration loader
+│   ├── retriever.py        # Past ticket search (BM25 + tags)
+│   ├── commands.py         # Slack slash commands
+│   ├── bucket.py           # Bucket watcher
+│   ├── monitor.py          # Polling monitor
+│   ├── webhook_app.py      # DevRev webhook handler
+│   └── prompts.py          # Prompt templates
+├── scripts/            # Utilities (fetch_my_solved, auto_watcher, etc.)
+├── template/           # PERSONA.md, SAFETY.md (agent prompts)
+├── workflows/          # Skill workflow templates
+├── data/               # Runtime data (gitignored)
+├── solved/             # Generated skill docs from solved tickets
+├── CLAUDE.md           # Instructions for Claude Code CLI
 ├── pyproject.toml
 ├── requirements.txt
-└── README.md
+├── run_bot.sh          # Start bot + auto-watcher
+├── run-monitor.sh      # Start ticket monitor
+└── setup_once.sh       # One-time setup
 ```
 
 ---
@@ -124,7 +233,8 @@ When you @mention the bot or run the agent, it now:
 
 ## Optional scripts
 
-- **Fetch my solved / generate skills:** `scripts/fetch_my_solved.py`, `scripts/generate_skills_from_solved.py`.
-- **Suggest from past (retriever + optional AI):** `scripts/suggest_from_past.py "issue text"` or `--suggest`.
-- **Monitor tickets (one-off):** `scripts/fetch_tickets_to_monitor.py --mode assigned-to-me`.
-- **Slack notify:** `scripts/slack_notify.py --ticket-id X --title "..." --suggestion "..."` (uses `SLACK_WEBHOOK_URL` in `scripts/.env`).
+- **Fetch my solved tickets:** `scripts/fetch_my_solved.py` (with optional `--no-timeline` for faster run). Or say **@bot fetch updated tickets** in Slack.
+- **Generate skills from solved:** `scripts/generate_skills_from_solved.py`.
+- **Suggest from past (CLI):** `scripts/suggest_from_past.py "issue text"` or `--suggest`.
+- **Register DevRev webhook:** `scripts/register_devrev_webhook.py --url https://YOUR-URL/webhooks/devrev`.
+- **Test tool connections:** `python3 scripts/test_tools_connection.py` — checks Redash, Querybook, Coralogix (keys in `scripts/.env`). See **docs/TOOLS_SETUP.md**.

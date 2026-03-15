@@ -1,6 +1,12 @@
 #!/bin/bash
-# Run the ticket monitor (handles venv internally - you never need to activate!)
+# Run the ticket monitor
 
 cd "$(dirname "$0")"
-source venv/bin/activate
+
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+elif [ -d "venv" ]; then
+    source venv/bin/activate
+fi
+
 python -m manideep_bot.monitor_cli run

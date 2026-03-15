@@ -19,6 +19,8 @@ scripts/.env
 # Data and logs
 *.log
 data/
+solved/
+logs/
 monitor_state.json
 
 # IDE

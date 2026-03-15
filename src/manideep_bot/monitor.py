@@ -264,21 +264,35 @@ def run_once(config):
 
         try:
             from .agent import reply
+            from .retriever import find_relevant, format_related_ticket_links
             response = reply(ticket_text, config)
             skill_name = _parse_skill_name(response)
             if len(response) > 2800:
                 response = response[:2800] + "\n… (truncated)"
+            relevant = find_relevant(ticket_text, config, top_k=5)
+            related_line = format_related_ticket_links(
+                relevant,
+                app_base_url=getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai",
+                max_items=5,
+            )
         except Exception as e:
             logger.warning("Agent analysis for %s: %s", display_id, e)
             response = f"Could not analyze: {e}"
             skill_name = "order-trace-debugger"
+            related_line = ""
 
-        message_text = (
-            f"🆕 *New PSE Ticket (Triage, unassigned)*\n"
-            f"*{display_id}* — {title[:80]}\n\n"
-            f"{response}\n\n"
-            f"—_Reply **Yes** to run the skill, then **Approve** to post resolution and close ticket._"
-        )
+        message_parts = [
+            "🆕 *New PSE Ticket (Triage, unassigned)*",
+            f"*{display_id}* — {title[:80]}",
+            "",
+            response,
+        ]
+        if related_line:
+            message_parts.append("")
+            message_parts.append(related_line)
+        message_parts.append("")
+        message_parts.append("—_Reply **Yes** to run the skill, then **Approve** to post resolution and close ticket._")
+        message_text = "\n".join(message_parts)
 
         _slack_post_interactive(
             text=message_text,
@@ -320,13 +334,30 @@ def run_once(config):
             if len(response) > 2800:
                 response = response[:2800] + "\n… (truncated)"
 
-            message_text = (
-                f"📝 *Assigned Ticket Update*\n"
-                f"*{display_id}* — {title[:80]} (Stage: {stage_name})\n\n"
-                f"*Latest update:*\n{new_content[:400]}\n\n"
-                f"*AI Analysis:*\n{response}\n\n"
-                f"—_Reply **Yes** to run the skill, then **Approve** to post resolution._"
+            from .retriever import find_relevant, format_related_ticket_links
+            relevant = find_relevant(analysis_text, config, top_k=5)
+            related_line = format_related_ticket_links(
+                relevant,
+                app_base_url=getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai",
+                max_items=5,
             )
+
+            message_parts = [
+                "📝 *Assigned Ticket Update*",
+                f"*{display_id}* — {title[:80]} (Stage: {stage_name})",
+                "",
+                "*Latest update:*",
+                new_content[:400],
+                "",
+                "*AI Analysis:*",
+                response,
+            ]
+            if related_line:
+                message_parts.append("")
+                message_parts.append(related_line)
+            message_parts.append("")
+            message_parts.append("—_Reply **Yes** to run the skill, then **Approve** to post resolution._")
+            message_text = "\n".join(message_parts)
 
             _slack_post_interactive(
                 text=message_text,
@@ -349,7 +380,7 @@ def run_once(config):
 
 
 def _run_solved_fetch_if_due(config):
-    """Run fetch_my_solved.py once per solved_fetch_interval_hours (e.g. once per day)."""
+    """Run fetch_my_solved.py once per solved_fetch_interval_hours (e.g. every 12h or 24h)."""
     import subprocess
     import sys
     state = _load_state()
@@ -360,32 +391,105 @@ def _run_solved_fetch_if_due(config):
         return
     script = _BOT_ROOT / "scripts" / "fetch_my_solved.py"
     if not script.exists():
-        logger.warning("scripts/fetch_my_solved.py not found; skipping daily solved fetch")
+        logger.warning("scripts/fetch_my_solved.py not found; skipping scheduled solved fetch")
         return
     try:
-        logger.info("Running daily solved tickets fetch (once per %.0fh)", interval_hours)
+        logger.info("Running scheduled solved tickets fetch (interval %.0fh)", interval_hours)
         subprocess.run(
             [sys.executable, str(script)],
             cwd=str(_BOT_ROOT),
             env=os.environ.copy(),
-            timeout=120,
+            timeout=600,
             capture_output=True,
         )
         state = _load_state()
         state["last_solved_fetch_ts"] = now
         _save_state(state)
     except Exception as e:
-        logger.warning("Daily solved fetch failed: %s", e)
+        logger.warning("Scheduled solved fetch failed: %s", e)
+
+
+def append_solved_ticket_after_approve(config, work_id: str):
+    """
+    Append the just-closed work to my_solved_tickets.json so it's available for retrieval
+    immediately without waiting for the next scheduled fetch. Uses same ticket shape as
+    fetch_my_solved.py (including thread_text from timeline).
+    """
+    from . import devrev_client
+
+    data_dir = config.paths.data_dir
+    out_file = data_dir / "my_solved_tickets.json"
+    if not out_file.exists():
+        return
+    try:
+        data = devrev_client.works_list(work_ids=[work_id], limit=1)
+        works = data.get("works") or []
+        if not works:
+            return
+        w = works[0]
+        # Timeline: comments/replies for "how it was solved" context
+        thread_text = ""
+        try:
+            tl = devrev_client.timeline_entries_list(work_id, limit=50)
+            for e in (tl.get("timeline_entries") or []):
+                body = e.get("body") or ""
+                if not body and e.get("body_parts"):
+                    for part in e.get("body_parts", []):
+                        if part.get("type") == "text":
+                            body += part.get("text", "") + "\n"
+                if body:
+                    thread_text += body.strip() + "\n"
+        except Exception as e:
+            logger.debug("Timeline for append: %s", e)
+        thread_text = thread_text.strip()[:10000]
+
+        tags_raw = w.get("tags") or []
+        tags_list = [{"name": (t.get("tag") or {}).get("name") or "", "value": t.get("value") or ""} for t in tags_raw]
+        tag_names = []
+        for t in tags_list:
+            if t["name"]:
+                tag_names.append(f"{t['name']}:{t['value']}" if t["value"] else t["name"])
+
+        ticket = {
+            "id": w.get("id"),
+            "display_id": w.get("display_id"),
+            "title": w.get("title"),
+            "body": (w.get("body") or "")[:5000],
+            "thread_text": thread_text,
+            "state": w.get("state"),
+            "stage": (w.get("stage") or {}).get("name"),
+            "created_date": w.get("created_date"),
+            "modified_date": w.get("modified_date"),
+            "type": w.get("type"),
+            "tags": tags_list,
+            "tag_names": tag_names,
+        }
+        with open(out_file) as f:
+            payload = json.load(f)
+        tickets = payload.get("tickets") or []
+        # Avoid duplicate by id
+        if any(t.get("id") == work_id for t in tickets):
+            return
+        tickets.append(ticket)
+        payload["tickets"] = tickets
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_file, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("Appended solved ticket %s to my_solved_tickets.json", w.get("display_id") or work_id)
+    except Exception as e:
+        logger.warning("Append solved ticket failed: %s", e)
 
 
 def run_loop(config):
-    """Run monitor every interval_minutes until interrupted."""
+    """
+    Run monitor every interval_minutes until interrupted.
+    Production design: prefer webhook for new issues (no polling). Use this loop only if you
+    need proactive "my tickets" updates. Solved tickets refresh = use Slack command
+    "fetch updated tickets" or system cron running scripts/fetch_my_solved.py.
+    """
     while True:
         try:
-            # Skip automatic solved tickets fetch - you already have 923 tickets cached
-            # Uncomment this if you want to refresh solved tickets daily:
-            # _run_solved_fetch_if_due(config)
-
+            # Solved fetch is NOT run here; use Slack "fetch updated tickets" or cron
             run_once(config)
         except Exception as e:
             logger.exception("Monitor run: %s", e)

@@ -1,8 +1,12 @@
 """
 Find relevant past solved tickets for a given issue description.
-Uses BM25 (when available) + tag boost for scoring so the AI gets the most relevant past work.
+Uses BM25 (when available) + tag boost; optional embeddings (OpenAI) for semantic similarity
+and min_similarity threshold to avoid misleading top-k when no good match exists.
+Thread text (timeline/conversation) is included in corpus and embeddings for better matching.
 """
+import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -163,6 +167,81 @@ def load_solved_tickets(data_dir: Path) -> list[dict]:
         return []
 
 
+def _ticket_search_text(t: dict) -> str:
+    """Single blob for BM25/embedding: title + body + thread (how it was solved)."""
+    title = (t.get("title") or "") or (t.get("display_id") or "")
+    body = t.get("body") or ""
+    thread = t.get("thread_text") or ""
+    return f"{title}\n{body}\n{thread}".strip()
+
+
+def _embed_openai(texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
+    """Call OpenAI embeddings API. Returns list of vectors (one per text)."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return []
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return []
+    client = OpenAI(api_key=api_key)
+    # API accepts up to 2048 inputs per request; we batch
+    out = []
+    batch = 100
+    for i in range(0, len(texts), batch):
+        chunk = [t[:8000] for t in texts[i : i + batch]]
+        r = client.embeddings.create(input=chunk, model=model)
+        for e in r.data:
+            out.append(e.embedding)
+    return out
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _load_or_build_embeddings(tickets: list[dict], data_dir: Path, provider: str = "openai") -> list[list[float]]:
+    """
+    Load cached embeddings for tickets or compute via provider (OpenAI) and cache.
+    Cache key: hash of sorted ticket ids so we refresh when solved set changes.
+    """
+    if not tickets:
+        return []
+    cache_file = data_dir / "my_solved_embeddings.json"
+    key_ids = sorted(t.get("id") or t.get("display_id") or str(i) for i, t in enumerate(tickets))
+    cache_key = hashlib.sha256(json.dumps(key_ids, sort_keys=True).encode()).hexdigest()[:32]
+    if cache_file.exists():
+        try:
+            with open(cache_file) as f:
+                data = json.load(f)
+            if data.get("cache_key") == cache_key and len(data.get("vectors", [])) == len(tickets):
+                return data["vectors"]
+        except Exception:
+            pass
+    texts = [_ticket_search_text(t) for t in tickets]
+    if provider == "openai":
+        vectors = _embed_openai(texts)
+    else:
+        vectors = []
+    if len(vectors) != len(tickets):
+        return []
+    data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(cache_file, "w") as f:
+            json.dump({"cache_key": cache_key, "vectors": vectors, "model": "text-embedding-3-small"}, f)
+    except Exception:
+        pass
+    return vectors
+
+
 def _score_tag_bonus(tag_names: list, query_terms: set[str], query_lower: str) -> float:
     """Bonus when ticket tags match the query (with fuzzy matching support)."""
     tag_bonus = 0.0
@@ -196,7 +275,8 @@ def find_relevant(
 ) -> list[dict]:
     """
     Given current issue text (title + description), return top_k relevant past solved tickets.
-    Scoring: BM25 (text) + tag bonus + fuzzy matching. Each item has: display_id, title, tag_names, body_snippet, score.
+    When use_embeddings: semantic similarity (OpenAI) + min_similarity threshold to avoid weak matches.
+    Else: BM25 (text) + tag bonus. Each item has: display_id, title, tag_names, body_snippet, score.
     """
     data_dir = data_dir or config.paths.data_dir
     tickets = load_solved_tickets(data_dir)
@@ -206,6 +286,9 @@ def find_relevant(
     rcfg = getattr(config, "retriever", None)
     k = top_k if top_k is not None else (rcfg.top_k if rcfg else 12)
     do_bm25 = use_bm25 if use_bm25 is not None else (rcfg.use_bm25 if rcfg else True)
+    use_embeddings = rcfg.use_embeddings if rcfg else False
+    min_sim = float(rcfg.min_similarity if rcfg else 0.0)
+    provider = (rcfg.embedding_provider if rcfg else "openai") or "openai"
 
     # Preprocess query with abbreviation expansion
     preprocessed_query = _preprocess_query(query)
@@ -213,12 +296,39 @@ def find_relevant(
     query_lower = preprocessed_query.lower()
     query_tokens = _tokenize_list(preprocessed_query)
 
-    # Build corpus: one token list per ticket (title + body)
+    # Optional: vector path (semantic similarity + threshold)
+    if use_embeddings and provider == "openai" and os.environ.get("OPENAI_API_KEY", "").strip():
+        vectors = _load_or_build_embeddings(tickets, data_dir, provider)
+        if vectors:
+            query_vecs = _embed_openai([preprocessed_query[:8000]])
+            if query_vecs:
+                qv = query_vecs[0]
+                scored_vec: list[tuple[float, dict]] = []
+                for i, t in enumerate(tickets):
+                    sim = _cosine_similarity(qv, vectors[i])
+                    tag_bonus = _score_tag_bonus(t.get("tag_names") or [], query_terms, query_lower)
+                    score = sim + 0.1 * tag_bonus
+                    if min_sim > 0 and sim < min_sim:
+                        continue
+                    title = (t.get("title") or "") or (t.get("display_id") or "")
+                    body = t.get("body") or ""
+                    snippet = _smart_snippet(body, query_terms) or (t.get("thread_text") or "")[:300].rsplit(maxsplit=1)[0] + "…"
+                    scored_vec.append((score, {
+                        "display_id": t.get("display_id") or "",
+                        "title": title,
+                        "tag_names": t.get("tag_names") or [],
+                        "body_snippet": snippet,
+                        "score": round(score, 2),
+                    }))
+                scored_vec.sort(key=lambda x: -x[0])
+                if scored_vec:
+                    return [item for _, item in scored_vec[:k]]
+                # Fall through to BM25 if no one passed threshold
+
+    # Build corpus: one token list per ticket (title + body + thread_text)
     corpus = []
     for t in tickets:
-        title = (t.get("title") or "") or (t.get("display_id") or "")
-        body = t.get("body") or ""
-        corpus.append(_tokenize_list(title + " " + body))
+        corpus.append(_tokenize_list(_ticket_search_text(t)))
 
     # Use cached BM25 index when available
     if do_bm25 and _BM25_AVAILABLE and corpus and query_tokens:
@@ -242,7 +352,7 @@ def find_relevant(
         if bm25_scores is not None:
             text_score = float(bm25_scores[i])
         else:
-            ticket_terms = _tokenize(title + " " + body) | _tag_tokens(tag_names)
+            ticket_terms = _tokenize(_ticket_search_text(t)) | _tag_tokens(tag_names)
             overlap = len(query_terms & ticket_terms) if query_terms else 0
             title_terms = _tokenize(title)
             title_match = len(query_terms & title_terms) if query_terms else 0
@@ -251,8 +361,10 @@ def find_relevant(
         tag_bonus = _score_tag_bonus(tag_names, query_terms, query_lower)
         score = text_score + tag_bonus
 
-        # Use smart snippet extraction (context-aware)
+        # Use smart snippet extraction (context-aware); prefer body, add thread hint if present
         snippet = _smart_snippet(body, query_terms)
+        if not snippet and t.get("thread_text"):
+            snippet = (t.get("thread_text") or "")[:300].rsplit(maxsplit=1)[0] + "…"
 
         scored.append((score, {
             "display_id": t.get("display_id") or "",
@@ -283,3 +395,24 @@ def format_relevant_for_prompt(relevant: list[dict], max_items: int = 10) -> str
             lines.append(f"   Summary: {snippet}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def format_related_ticket_links(
+    relevant: list[dict],
+    app_base_url: str = "https://app.devrev.ai",
+    max_items: int = 5,
+) -> str:
+    """Format top relevant tickets as Slack links for 'Related past tickets' line."""
+    if not relevant:
+        return ""
+    base = (app_base_url or "https://app.devrev.ai").rstrip("/")
+    parts = []
+    for t in relevant[:max_items]:
+        display_id = (t.get("display_id") or "").strip()
+        if not display_id:
+            continue
+        url = f"{base}/works/{display_id}"
+        parts.append(f"<{url}|{display_id}>")
+    if not parts:
+        return ""
+    return "Related past tickets: " + ", ".join(parts)

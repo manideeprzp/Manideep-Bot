@@ -58,7 +58,38 @@ def list_works(owned_by_ids, state_filter, limit=50, cursor=None):
     return r.json()
 
 
-def main():
+def timeline_entries_list(object_id, limit=50):
+    """Fetch timeline (comments/replies) for a work to capture how it was solved."""
+    r = requests.get(
+        f"{DEVREV_BASE}/timeline-entries.list",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        params={"object": object_id, "limit": limit},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_thread_text(work_id):
+    """Concatenate timeline entry bodies for a work (comments = conversation)."""
+    try:
+        data = timeline_entries_list(work_id, limit=50)
+        entries = data.get("timeline_entries") or []
+        parts = []
+        for e in entries:
+            body = e.get("body") or ""
+            if not body and e.get("body_parts"):
+                for part in e.get("body_parts", []):
+                    if part.get("type") == "text":
+                        body += part.get("text", "") + "\n"
+            if body and body.strip():
+                parts.append(body.strip())
+        return "\n".join(parts)[:10000]
+    except Exception:
+        return ""
+
+
+def main(fetch_timeline=True):
     if not API_KEY:
         print("Set DEVREV_API_KEY in scripts/.env", file=sys.stderr)
         sys.exit(1)
@@ -94,13 +125,16 @@ def main():
         return tags, tag_names
 
     out = []
-    for w in all_works:
+    for i, w in enumerate(all_works):
         tags_list, tag_names = extract_tags(w)
+        work_id = w.get("id")
+        thread_text = extract_thread_text(work_id) if (work_id and fetch_timeline) else ""
         out.append({
-            "id": w.get("id"),
+            "id": work_id,
             "display_id": w.get("display_id"),
             "title": w.get("title"),
             "body": (w.get("body") or "")[:5000],
+            "thread_text": thread_text,
             "state": w.get("state"),
             "stage": (w.get("stage") or {}).get("name"),
             "created_date": w.get("created_date"),
@@ -109,6 +143,8 @@ def main():
             "tags": tags_list,
             "tag_names": tag_names,
         })
+        if (i + 1) % 50 == 0:
+            print(f"Fetched {i + 1}/{len(all_works)} (with timeline)...", file=sys.stderr)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_FILE, "w") as f:
@@ -119,4 +155,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Fetch your solved DevRev tickets (and optionally timeline per ticket).")
+    parser.add_argument("--no-timeline", action="store_true", help="Skip timeline fetch (faster; no thread_text).")
+    args = parser.parse_args()
+    main(fetch_timeline=not args.no_timeline)

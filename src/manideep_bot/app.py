@@ -1,10 +1,27 @@
-"""Manideep Bot: Slack Socket Mode, @mention + thread replies (Yes/Proceed → run skill; Approve → post on DevRev and close)."""
+"""Manideep Bot: Slack Socket Mode.
+
+Two distinct channels:
+  watch_channel (C084W9R9T3J / #engage-production-issues)
+    → Listens for new DevRev ticket notifications posted by DevRev itself.
+    → Extracts ISS-XXXXXX from the message text OR Slack blocks.
+    → Fetches the full ticket from DevRev in ONE API call (no pagination).
+    → If the ticket is unassigned (owned by SVCACC-2): auto-assigns to Manideep immediately.
+    → Posts AI analysis + skill suggestion as a THREAD REPLY (keeps the channel clean).
+    → You reply "Yes" in the thread → skill runs; "Approve" → posts resolution + closes ticket.
+
+  bucket_channel (C0AHL6C343V / your private bot channel)
+    → Bot proactively posts updates about tickets already assigned to you.
+    → New replies on your tickets, ticket stage changes, daily summary, etc.
+    → Same Yes/Approve workflow to run skills and close tickets.
+"""
 import logging
 import os
 import re
 
 from .config import load_config
 from .agent import reply
+from .enhanced_agent import enhanced_reply
+from .claude_code_agent import claude_code_reply
 
 logger = logging.getLogger(__name__)
 
@@ -20,42 +37,131 @@ def _thread_key(event):
 
 def _normalize_approve(text):
     t = (text or "").strip().lower()
-    if t in ("yes", "proceed", "y", "go"):
+    if t in ("yes", "proceed", "y", "go", "run it", "done"):
         return "yes"
     if t in ("approve", "approved", "close it", "post and close"):
         return "approve"
     return None
 
 
+def _parse_work_id_from_event(event: dict):
+    """
+    Extract ISS-XXXXXX / TKT-XXXXXX from a Slack event.
+    Checks:
+      1. Message text
+      2. Attachment text / fallback
+      3. Block IDs (DevRev posts block_id = 'devrev-view-title-ISS-XXXXXX')
+      4. Block text fields (rich_text sections, etc.)
+    Returns the display_id string or None.
+    """
+    # We only deal with ISS issues; TKT tickets are out of our scope
+    pattern = re.compile(r"\b(ISS|ISSUE)-(\d+)\b", re.I)
+
+    def _search(s):
+        if not s:
+            return None
+        m = pattern.search(str(s))
+        return m.group(0) if m else None
+
+    # 1. Direct text
+    found = _search(event.get("text"))
+    if found:
+        return found
+
+    # 2. Attachments
+    for att in (event.get("attachments") or []):
+        found = _search(att.get("text")) or _search(att.get("fallback")) or _search(att.get("pretext"))
+        if found:
+            return found
+
+    # 3 & 4. Blocks (DevRev uses block_id like 'devrev-view-title-ISS-1659563')
+    for block in (event.get("blocks") or []):
+        found = _search(block.get("block_id"))
+        if found:
+            return found
+        # Rich-text / section elements
+        for element in (block.get("elements") or block.get("fields") or []):
+            if isinstance(element, dict):
+                found = _search(element.get("text")) or _search(element.get("block_id"))
+                if found:
+                    return found
+                # Nested elements inside rich_text_section
+                for sub in (element.get("elements") or []):
+                    if isinstance(sub, dict):
+                        found = _search(sub.get("text")) or _search(sub.get("url"))
+                        if found:
+                            return found
+
+    # 5. DevRev URL in text (https://app.devrev.ai/razorpay/issue/ISS-1659563)
+    url_m = re.search(r"devrev\.ai/[^/\s]+/[^/\s]+/([A-Za-z]+-\d+)", event.get("text") or "")
+    if url_m:
+        return url_m.group(1)
+
+    return None
+
+
 def _parse_work_id(text):
-    """Extract DevRev work ID from text (e.g. ISSUE-123, or https://app.devrev.ai/...)."""
+    """Extract ISS-XXXXXX display_id from plain text (used in mention / thread reply context)."""
     if not text:
         return None
-    m = re.search(r"(ISSUE|TICKET|INC)-[\w-]+", text, re.I)
+    m = re.search(r"\b(ISS|ISSUE)-(\d+)\b", text, re.I)
     if m:
         return m.group(0)
-    m = re.search(r"devrev\.ai/[^/\s]+/([A-Za-z0-9_-]+)", text)
+    m = re.search(r"devrev\.ai/[^/\s]+/[^/\s]+/([A-Z]+-\d+)", text, re.I)
     if m:
         return m.group(1)
     return None
 
 
 def _parse_skill_name(text):
-    """Extract skill name from agent reply (supports both old and new structured formats)."""
     if not text:
         return None
-
-    # Try structured format: **Skill to run:** skill-name
     m = re.search(r"\*\*skill\s+to\s+run:\*\*\s*([a-z0-9-]+)", text, re.I)
     if m:
         return m.group(1).strip()
-
-    # Try legacy format: skill: skill-name
     m = re.search(r"skill[:\s]+([a-z0-9-]+)", text, re.I)
     if m:
         return m.group(1).strip()
-
     return None
+
+
+def _is_unassigned(work: dict, svcacc_id: str) -> bool:
+    """
+    Return True if the ticket is effectively unassigned.
+    DevRev sets owned_by = [SVCACC-2] for tickets with no real owner.
+    Also treats empty owned_by as unassigned.
+    """
+    owners = work.get("owned_by") or []
+    if not owners:
+        return True
+    owner_ids = [
+        (o.get("id") if isinstance(o, dict) else str(o))
+        for o in owners
+    ]
+    # If the only owner is SVCACC-2, it's unassigned
+    if svcacc_id and all(oid == svcacc_id for oid in owner_ids):
+        return True
+    return False
+
+
+def _get_analysis(ticket_text: str, config, ticket_id: str = None, channel: str = None, thread_ts: str = None):
+    """
+    Get ticket analysis using the best available method:
+    1. If ANTHROPIC_API_KEY set → use enhanced_reply (Claude API) - returns str
+    2. Otherwise → use claude_code_reply (local Claude Code analysis) - returns (str, timestamp)
+
+    Returns:
+        - If API key: str (analysis message)
+        - If Claude Code: tuple (message, timestamp)
+    """
+    has_api_key = bool(getattr(config.anthropic, "api_key", None))
+
+    if has_api_key:
+        logger.debug("Using enhanced_reply (Anthropic API)")
+        return enhanced_reply(ticket_text, config)
+    else:
+        logger.info("No API key - using Claude Code local analysis")
+        return claude_code_reply(ticket_text, config, ticket_id, channel, thread_ts)
 
 
 def run_slack_bot():
@@ -73,6 +179,23 @@ def run_slack_bot():
 
     app = App(token=config.slack.bot_token)
 
+    from .response_watcher import start_response_watcher, save_thread_mapping
+    start_response_watcher(app.client)
+
+    watch_ch = (config.slack.watch_channel_id or "").strip()
+    bucket_ch = (config.slack.bucket_channel_id or "").strip()
+    my_user_id = (config.devrev.my_user_id or "").strip()
+    svcacc_id = (config.devrev.unassigned_svcacc_id or "").strip()
+
+    logger.info(
+        "Bot config — watch_channel: %s | bucket_channel: %s | my_user_id: %s",
+        watch_ch or "(none)",
+        bucket_ch or "(none)",
+        my_user_id or "(not set — auto-assign disabled)",
+    )
+
+    # ── Mention handler ──────────────────────────────────────────────────────
+
     def handle_mention(event, say, client):
         thread_ts = event.get("thread_ts") or event.get("ts")
         user_id = event.get("user", "")
@@ -83,38 +206,58 @@ def run_slack_bot():
             return
 
         if not text:
-            say(
-                text="Share a ticket title/description or link and I'll suggest an approach. Then reply **Yes** to run the skill, or **Approve** (after I post output) to post on the ticket and close it.",
-                thread_ts=thread_ts,
-            )
+            from .commands import get_commands_help
+            say(text=get_commands_help(), thread_ts=thread_ts)
             return
 
-        say(text="Thinking…", thread_ts=thread_ts)
+        from .commands import get_command_id, is_bot_command, run_command
+        if is_bot_command(text):
+            cmd_id = get_command_id(text)
+            say(text="Running...", thread_ts=thread_ts)
+            reply_text = run_command(cmd_id, config)
+            say(text=reply_text, thread_ts=thread_ts)
+            return
+
+        say(text=":hourglass_flowing_sand: Analysing...", thread_ts=thread_ts)
         try:
-            response = reply(text, config)
-            if len(response) > 3900:
-                response = response[:3900] + "\n… (truncated)"
-            say(text=response, thread_ts=thread_ts)
+            channel = event.get("channel")
+            ticket_id = _parse_work_id(text)
+            result = _get_analysis(text, config, ticket_id, channel, thread_ts)
+
+            if isinstance(result, tuple):
+                response, returned_ticket_id = result
+                if returned_ticket_id:
+                    save_thread_mapping(returned_ticket_id, channel, thread_ts)
+                say(text=response, thread_ts=thread_ts)
+            else:
+                response = result
+                from .response_watcher import _post_formatted
+                _post_formatted(app.client, channel, thread_ts, ticket_id or "ticket", response)
+
             key = _thread_key(event)
+            display_id = _parse_work_id(text)
+            from . import devrev_client
+            work_id = devrev_client.display_id_to_work_id(display_id) if display_id else None
             _thread_state[key] = {
                 "step": "suggested",
                 "ticket_text": text,
-                "work_id": _parse_work_id(text),
+                "work_id": work_id,
+                "display_id": display_id,
                 "skill_name": _parse_skill_name(response) or "order-trace-debugger",
             }
         except Exception as e:
             logger.exception("Agent error")
             say(text=f"Error: {e}", thread_ts=thread_ts)
 
+    # ── Thread reply handler ─────────────────────────────────────────────────
+
     def handle_message(event, say, client):
-        # Only handle replies in threads (from @mention or from bucket post)
         thread_ts = event.get("thread_ts")
         if not thread_ts:
             return
         ch = event.get("channel", "")
         key = (ch, thread_ts)
         state = _thread_state.get(key)
-        # If not from @mention, check bucket thread state (bot posted "my bucket" suggestion)
         from . import bucket as bucket_mod
         if not state:
             state = bucket_mod.get_thread_state_from_bucket(ch, thread_ts)
@@ -124,12 +267,8 @@ def run_slack_bot():
         if not state:
             return
 
-        user_id = event.get("user", "")
         text = (event.get("text") or "").strip()
         cmd = _normalize_approve(text)
-        # "Done" same as "Yes" for bucket flow
-        if not cmd and (text or "").strip().lower() in ("done", "run it"):
-            cmd = "yes"
 
         if cmd == "yes" and state.get("step") == "suggested":
             from . import skill_runner
@@ -137,9 +276,12 @@ def run_slack_bot():
             skill_name = state.get("skill_name") or "order-trace-debugger"
             out, ok = skill_runner.run_skill(skill_name, ticket_text)
             if not ok:
-                say(text=f"Could not run skill: {out}\nReply with **Done** again after adding the missing info (e.g. order_id).", thread_ts=thread_ts)
+                say(text=f"Could not run skill: {out}\nReply **Done** again after adding missing info (e.g. order_id).", thread_ts=thread_ts)
                 return
-            say(text=f"Work done. Output:\n```\n{out[:2500]}\n```\n\nReview. If correct, reply **Approve** to post this on the ticket and close it.", thread_ts=thread_ts)
+            say(
+                text=f"Work done. Output:\n```\n{out[:2500]}\n```\n\nReview. If correct, reply **Approve** to post this on the ticket and close it.",
+                thread_ts=thread_ts,
+            )
             state["step"] = "pending_approve"
             state["output"] = out
             state["summary"] = out[:500]
@@ -152,7 +294,6 @@ def run_slack_bot():
         if state.get("step") == "pending_approve" and not state.get("work_id"):
             wid = _parse_work_id(text)
             if wid:
-                # Resolve display_id to full work_id if we only have display_id (bucket has work_id)
                 state["work_id"] = state.get("work_id") or wid
                 state["display_id"] = wid
                 if is_bucket:
@@ -165,14 +306,60 @@ def run_slack_bot():
         if cmd == "approve" and state.get("step") == "pending_approve":
             work_id = state.get("work_id")
             if not work_id:
-                say(text="I don't have the ticket ID. Please paste the DevRev work ID (e.g. ISSUE-123) so I can post the update and close it.", thread_ts=thread_ts)
+                say(
+                    text="I don't have the ticket ID. Please paste the DevRev work ID (e.g. ISS-123) so I can post the update and close it.",
+                    thread_ts=thread_ts,
+                )
                 return
             try:
                 from . import devrev_client
+                from .monitor import append_solved_ticket_after_approve
+                from .claude_code_agent import load_similar_data
+
                 summary = state.get("summary") or state.get("output") or "Resolved by Manideep Bot."
-                devrev_client.timeline_entry_create(work_id, f"Resolution:\n{summary}")
-                devrev_client.work_update_stage(work_id, config.devrev.closed_stage_name)
-                say(text=f"Posted update on ticket and set stage to **{config.devrev.closed_stage_name}**. Done.", thread_ts=thread_ts)
+                skill_name = (state.get("skill_name") or "").strip()
+                display_id = state.get("display_id") or ""
+
+                # Load similar ticket data (tags + fields saved during analysis)
+                similar_data = load_similar_data(display_id) if display_id else {}
+                similar_tags = similar_data.get("suggested_tags") or []
+                similar_fields = similar_data.get("suggested_fields") or {}
+                similar_tickets = similar_data.get("similar_tickets") or []
+                best_similar_id = similar_tickets[0].get("display_id", "") if similar_tickets else ""
+
+                # 1. Build structured resolution comment
+                resolution_comment = devrev_client.build_resolution_comment(
+                    summary=summary,
+                    skill_name=skill_name,
+                    similar_ticket_id=best_similar_id,
+                )
+
+                # 2. Build tags: similar ticket tags + skill tag + bot_resolved
+                tags_to_add = devrev_client.build_tags_for_closure(
+                    skill_name=skill_name,
+                    similar_ticket_tags=similar_tags,
+                )
+
+                # 3. Comprehensive update: comment + tags + stage + custom fields
+                devrev_client.work_update_full(
+                    work_id=work_id,
+                    stage_name=config.devrev.closed_stage_name,
+                    tags_to_add=tags_to_add,
+                    comment=resolution_comment,
+                    custom_fields=similar_fields if similar_fields else None,
+                )
+
+                append_solved_ticket_after_approve(config, work_id)
+
+                # Build Slack confirmation with details
+                tag_names = [t["name"] for t in tags_to_add]
+                confirm_parts = [
+                    f"Posted resolution on ticket and set stage to *{config.devrev.closed_stage_name}*.",
+                    f"Tags added: {', '.join(f'`{t}`' for t in tag_names)}" if tag_names else "",
+                    f"Similar ticket referenced: `{best_similar_id}`" if best_similar_id else "",
+                    "Done.",
+                ]
+                say(text="\n".join(p for p in confirm_parts if p), thread_ts=thread_ts)
             except Exception as e:
                 logger.exception("DevRev post/close: %s", e)
                 say(text=f"Failed to post/close: {e}", thread_ts=thread_ts)
@@ -182,18 +369,151 @@ def run_slack_bot():
                 _thread_state.pop(key, None)
             return
 
+    # ── New-issue notification handler ───────────────────────────────────────
+
+    def handle_new_issue_notification(event, say, client):
+        """
+        Watches #engage-production-issues (watch_channel_id) for new DevRev ticket posts.
+
+        Flow:
+          1. Extract ISS-XXXXXX from message text OR blocks (handles all DevRev message formats).
+          2. Fetch ticket from DevRev in a SINGLE API call (fast path: construct DON ID directly).
+          3. If unassigned (owned by SVCACC-2 or empty): auto-assign to Manideep immediately.
+          4. Post AI analysis as a thread reply — channel stays clean for everyone else.
+          5. Yes/Approve flow works in that thread.
+        """
+        ch = event.get("channel", "")
+        target_ch = (config.slack.watch_channel_id or config.slack.bucket_channel_id or "").strip()
+        if not target_ch or ch != target_ch:
+            return False
+        # Only react to top-level posts (not replies in existing threads)
+        if event.get("thread_ts"):
+            return False
+        # Skip messages from bots that are not DevRev (don't recurse on our own replies)
+        bot_id = event.get("bot_id") or ""
+        subtype = event.get("subtype") or ""
+        # Allow bot messages (DevRev posts as a bot), but not message_changed / message_deleted
+        if subtype in ("message_changed", "message_deleted", "bot_remove", "bot_add"):
+            return False
+
+        display_id = _parse_work_id_from_event(event)
+        if not display_id:
+            logger.debug("watch_channel message has no ISS/TKT ID — skipping (bot_id=%s)", bot_id)
+            return False
+
+        from . import devrev_client
+        from . import bucket as bucket_mod
+
+        # FAST: single API call using constructed DON ID
+        work = devrev_client.get_work_by_display_id(display_id)
+        if not work:
+            logger.warning("Could not fetch %s from DevRev — skipping", display_id)
+            return True  # don't spam the global channel with errors
+
+        work_id = work.get("id", "")
+        title = (work.get("title") or "")[:200]
+        body = (work.get("body") or "")[:3000]
+        ticket_text = f"{title}\n\n{body}".strip() or str(display_id)
+        msg_ts = event.get("ts")
+
+        # ── Auto-assign if unassigned ──────────────────────────────────────
+        assigned_now = False
+        skip_reason = None
+        if my_user_id and _is_unassigned(work, svcacc_id):
+            # Check if user already has too many tickets
+            try:
+                current_count = devrev_client.count_open_tickets_for_user(my_user_id)
+                if current_count >= 15:
+                    skip_reason = f"Already have {current_count} open tickets (limit: 15)"
+                    logger.info("Skipping auto-assign for %s: %s", display_id, skip_reason)
+                else:
+                    devrev_client.work_assign(work_id, my_user_id)
+                    assigned_now = True
+                    logger.info("Auto-assigned %s to Manideep (%s) — now %d tickets", display_id, my_user_id, current_count + 1)
+            except Exception as e:
+                logger.error("Auto-assign failed for %s: %s", display_id, e)
+
+        # ── AI analysis → post to YOUR private bucket channel only ──────────
+        # Zero messages in the watch channel. Just silent auto-assign above.
+        if not bucket_ch:
+            logger.warning("bucket_channel_id not set — cannot post analysis for %s", display_id)
+            return True
+
+        try:
+            from .response_watcher import _post_formatted
+
+            app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
+            ticket_url = f"{app_base}/razorpay/issue/{display_id}"
+            if assigned_now:
+                status_line = ":white_check_mark: Auto-assigned to you"
+            elif skip_reason:
+                status_line = f":no_entry_sign: Not assigned: {skip_reason}"
+            else:
+                status_line = "_(already assigned)_"
+
+            # 1. Post ticket notification (top-level message in bucket channel)
+            notify_result = client.chat_postMessage(
+                channel=bucket_ch,
+                text=f"{display_id} — {title[:80]}",
+                attachments=[{
+                    "color": "#0052CC",
+                    "title": f"{display_id} — {title[:80]}",
+                    "title_link": ticket_url,
+                    "text": status_line,
+                    "footer": "DevRev · PSE",
+                }],
+            )
+            posted_ts = notify_result["ts"]
+
+            # 2. Get analysis
+            result = _get_analysis(ticket_text, config, display_id)
+
+            ticket_timestamp = None
+            if isinstance(result, tuple):
+                response, ticket_timestamp = result
+            else:
+                response = result
+
+            skill_name = _parse_skill_name(response) or "order-trace-debugger"
+
+            if ticket_timestamp:
+                save_thread_mapping(ticket_timestamp, bucket_ch, posted_ts)
+            else:
+                _post_formatted(client, bucket_ch, posted_ts, display_id, response)
+
+            bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                "step": "suggested",
+                "work_id": work_id,
+                "display_id": display_id,
+                "ticket_text": ticket_text,
+                "skill_name": skill_name,
+            })
+            logger.info("Posted analysis for %s in bucket channel %s (assigned=%s)", display_id, bucket_ch, assigned_now)
+        except Exception as e:
+            logger.exception("Notification handler error for %s: %s", display_id, e)
+        return True
+
+    # ── Register handlers ────────────────────────────────────────────────────
+
     @app.event("app_mention")
     def on_mention(event, say, client):
         handle_mention(event, say, client)
 
     @app.event("message")
     def on_message(event, say, client):
+        if handle_new_issue_notification(event, say, client):
+            return
         if event.get("bot_id"):
             return
         handle_message(event, say, client)
 
     handler = SocketModeHandler(app, config.slack.app_token)
-    logger.info("Manideep Bot starting (Socket Mode); @mention + thread Yes/Approve")
+    logger.info(
+        "Manideep Bot starting (Socket Mode) | watch=%s | bucket=%s | auto-assign=%s",
+        watch_ch or "none",
+        bucket_ch or "none",
+        "ON" if my_user_id else "OFF (set DEVREV_MY_USER_ID)",
+    )
     handler.start()
 
 
@@ -208,12 +528,12 @@ def run():
     env = os.environ.get("APP_ENV", "dev")
     logging.basicConfig(
         level=logging.DEBUG if env == "dev" else logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
     logger.info("Loading config and starting Manideep Bot...")
     try:
         run_slack_bot()
-    except SystemExit as e:
+    except SystemExit:
         raise
     except Exception as e:
         logger.exception("Bot failed to start: %s", e)

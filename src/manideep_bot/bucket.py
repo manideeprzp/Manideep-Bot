@@ -129,20 +129,34 @@ def run_bucket_once(config: Config) -> int:
             ticket_text = str(display_id)
 
         try:
+            from .retriever import find_relevant, format_related_ticket_links
             response = reply(ticket_text, config)
+            relevant = find_relevant(ticket_text, config, top_k=5)
+            related_line = format_related_ticket_links(
+                relevant,
+                app_base_url=getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai",
+                max_items=5,
+            )
         except Exception as e:
             logger.exception("Agent error for %s: %s", display_id, e)
             response = f"Could not analyze: {e}. Reply **Done** to try running a skill anyway."
+            related_line = ""
 
         skill_name = _parse_skill_name(response)
         if len(response) > 2800:
             response = response[:2800] + "\n… (truncated)"
 
-        text = (
-            f"*Ticket {display_id}* — {title}\n\n"
-            f"{response}\n\n"
-            f"—_Reply **Done** in this thread to run the skill and see execution. Then **Approve** to post on DevRev and close._"
-        )
+        message_parts = [
+            f"*Ticket {display_id}* — {title}",
+            "",
+            response,
+        ]
+        if related_line:
+            message_parts.append("")
+            message_parts.append(related_line)
+        message_parts.append("")
+        message_parts.append("—_Reply **Done** in this thread to run the skill and see execution. Then **Approve** to post on DevRev and close._")
+        text = "\n".join(message_parts)
 
         try:
             resp = client.chat_postMessage(

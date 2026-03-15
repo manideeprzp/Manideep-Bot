@@ -15,6 +15,7 @@ dependencies = [
 manideep-bot = "manideep_bot.app:run"
 manideep-bot-monitor = "manideep_bot.monitor_cli:main"
 manideep-bot-bucket = "manideep_bot.bucket_cli:main"
+manideep-bot-webhook = "manideep_bot.webhook_cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

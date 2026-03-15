@@ -30,8 +30,11 @@ class SlackConfig:
     app_token: str = ""
     team_id: str = ""
     allowed_user_ids: list = None
-    # Channel where bucket watcher posts "my tickets" suggestions (reply Done / Approve in thread)
+    # Channel where bot posts proactive "my tickets" updates (private/personal channel)
     bucket_channel_id: str = ""
+    # Channel to LISTEN for DevRev ticket notifications (e.g. #engage-production-issues)
+    # Bot watches this channel, filters by your parts, replies in thread for matching tickets
+    watch_channel_id: str = ""
 
     def __post_init__(self):
         if self.allowed_user_ids is None:
@@ -47,18 +50,18 @@ class AnthropicConfig:
 
 
 @dataclass
-class GeminiConfig:
-    api_key: str = ""
-    model: str = "gemini-pro"
-    max_tokens: int = 8192
-
-
-@dataclass
 class DevRevConfig:
     api_key: str = ""
     solved_states: str = "closed,done,resolved"
-    pod_part_id: str = ""
     closed_stage_name: str = "Closed"
+    # Webhook: secret from DevRev webhooks.create (for X-DevRev-Signature verification)
+    webhook_secret: str = ""
+    # Base URL for ticket links in Slack (e.g. https://app.devrev.ai)
+    app_base_url: str = "https://app.devrev.ai"
+    # Your own DevRev user DON ID — used for auto-assigning unassigned tickets
+    my_user_id: str = ""
+    # SVCACC-2 DON ID — DevRev assigns unassigned tickets to this service account
+    unassigned_svcacc_id: str = "don:identity:dvrv-in-1:devo/2sRI6Hepzz:svcacc/2"
 
 
 @dataclass
@@ -92,9 +95,12 @@ class MonitorConfig:
 
 @dataclass
 class RetrieverConfig:
-    """Retrieval of relevant past solved tickets (BM25 + tag boost)."""
+    """Retrieval of relevant past solved tickets (BM25 + tag boost; optional embeddings + threshold)."""
     top_k: int = 12
     use_bm25: bool = True
+    use_embeddings: bool = False
+    embedding_provider: str = "openai"
+    min_similarity: float = 0.0
 
 
 @dataclass
@@ -130,14 +136,11 @@ class PathsConfig:
 class Config:
     slack: SlackConfig
     anthropic: AnthropicConfig
-    gemini: GeminiConfig
     devrev: DevRevConfig
     monitor: MonitorConfig
     retriever: RetrieverConfig
     bucket: BucketConfig
     paths: PathsConfig
-    # AI provider for suggestions: "anthropic" (Claude) or "gemini" (Google)
-    ai_provider: str = "anthropic"
 
 
 def load_config(env: str = None) -> Config:
@@ -150,9 +153,7 @@ def load_config(env: str = None) -> Config:
 
     slk = raw.get("slack", {})
     ant = raw.get("anthropic", {})
-    gem = raw.get("gemini", {})
     dev = raw.get("devrev", {})
-    ai_section = raw.get("ai", {})
 
     return Config(
         slack=SlackConfig(
@@ -162,6 +163,7 @@ def load_config(env: str = None) -> Config:
             team_id=_env_or("SLACK_TEAM_ID", slk.get("team_id")),
             allowed_user_ids=slk.get("allowed_user_ids", []),
             bucket_channel_id=_env_or("SLACK_BUCKET_CHANNEL_ID", slk.get("bucket_channel_id") or ""),
+            watch_channel_id=_env_or("SLACK_WATCH_CHANNEL_ID", slk.get("watch_channel_id") or ""),
         ),
         anthropic=AnthropicConfig(
             api_key=_env_or("ANTHROPIC_API_KEY", ant.get("api_key")),
@@ -169,22 +171,23 @@ def load_config(env: str = None) -> Config:
             max_tokens=int(ant.get("max_tokens", 8192)),
             max_turns=int(ant.get("max_turns", 20)),
         ),
-        gemini=GeminiConfig(
-            api_key=_env_or("GEMINI_API_KEY", _env_or("GOOGLE_API_KEY", gem.get("api_key"))),
-            model=_env_or("GEMINI_MODEL", gem.get("model", "gemini-pro")),
-            max_tokens=int(gem.get("max_tokens", 8192)),
-        ),
         devrev=DevRevConfig(
             api_key=_env_or("DEVREV_API_KEY", dev.get("api_key")),
             solved_states=_env_or("DEVREV_SOLVED_STATES", dev.get("solved_states"), "closed,done,resolved"),
-            pod_part_id=_env_or("DEVREV_POD_PART_ID", dev.get("pod_part_id")),
             closed_stage_name=_env_or("DEVREV_CLOSED_STAGE", dev.get("closed_stage_name"), "Closed"),
+            webhook_secret=_env_or("DEVREV_WEBHOOK_SECRET", dev.get("webhook_secret")),
+            app_base_url=_env_or("DEVREV_APP_BASE_URL", dev.get("app_base_url"), "https://app.devrev.ai"),
+            my_user_id=_env_or("DEVREV_MY_USER_ID", dev.get("my_user_id"), ""),
+            unassigned_svcacc_id=_env_or(
+                "DEVREV_UNASSIGNED_SVCACC_ID",
+                dev.get("unassigned_svcacc_id"),
+                "don:identity:dvrv-in-1:devo/2sRI6Hepzz:svcacc/2",
+            ),
         ),
         monitor=_load_monitor(raw.get("monitor", {})),
         retriever=_load_retriever(raw.get("retriever", {})),
         bucket=_load_bucket(raw.get("bucket", {})),
         paths=PathsConfig(),
-        ai_provider=(_env_or("AI_PROVIDER", ai_section.get("provider")) or "anthropic").lower().strip(),
     )
 
 
@@ -192,6 +195,9 @@ def _load_retriever(raw: dict) -> "RetrieverConfig":
     return RetrieverConfig(
         top_k=int(raw.get("top_k", 12)),
         use_bm25=bool(raw.get("use_bm25", True)),
+        use_embeddings=bool(raw.get("use_embeddings", False)),
+        embedding_provider=(raw.get("embedding_provider") or "openai").strip(),
+        min_similarity=float(raw.get("min_similarity", 0.0)),
     )
 
 
@@ -223,8 +229,11 @@ def _load_monitor(raw: dict) -> "MonitorConfig":
         except ValueError:
             interval_hours = 24.0
     my_cfg = raw.get("my_tickets", {})
+    enabled = raw.get("enabled", False)
+    if os.environ.get("MONITOR_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        enabled = True
     return MonitorConfig(
-        enabled=raw.get("enabled", False),
+        enabled=enabled,
         interval_minutes=int(raw.get("interval_minutes", 20)),
         new_ticket_filter_parts=parts,
         new_ticket_filter_part_names=part_names,

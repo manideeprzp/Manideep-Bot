@@ -1,5 +1,18 @@
 # APIs and tokens needed for Manideep Bot
 
+## Which API key for what (and why)
+
+| Purpose | API / key | Why |
+|--------|-----------|-----|
+| **Understand issue + suggest approach + skill** | **Anthropic (Claude)** — `ANTHROPIC_API_KEY` | Claude is used for all "understanding" and structured suggestion (analysis, approach, skill_name, confidence). One-shot Messages API; no tool loop required. |
+| **Semantic retrieval (optional)** | **OpenAI** — `OPENAI_API_KEY` | Anthropic does **not** offer an embedding API. For vector/semantic search (better than BM25-only and `min_similarity` to avoid misleading top-k), we use OpenAI `text-embedding-3-small`. |
+| **DevRev** | **DevRev** — `DEVREV_API_KEY` | List/fetch works, timeline, post resolution, close. |
+| **Slack** | **Slack** Bot + App token + `SLACK_BUCKET_CHANNEL_ID` | Post suggestions and read thread replies (Yes / Approve). |
+
+**Claude Agent SDK:** The [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview) is for **agent loops** (tools, MCP, sessions). We do **not** need it for "description understanding" or "skill suggestion"—our flow is a single prompt + structured response, which the standard Anthropic Messages API handles. The Agent SDK does **not** provide embeddings; for vector retrieval you still need an embedding provider (OpenAI or similar).
+
+---
+
 ## Tokens you need to give (bucket flow: no pasting)
 
 For the bot to **watch your bucket**, **analyze tickets**, and let you **Done → Approve** in Slack, set these:
@@ -20,11 +33,13 @@ You do **not** paste anything: the bot fetches tickets assigned to you, finds re
 
 | What | API / dependency | Required? |
 |------|-------------------|-----------|
-| **Solved tickets data** | None (local file) | Yes — run `scripts/fetch_my_solved.py` first; uses **DevRev API** |
-| **BM25 scoring** | None (library `rank_bm25`) | No — optional; falls back to word-overlap if not installed |
-| **Tag + text matching** | None | No — runs offline once `data/my_solved_tickets.json` exists |
+| **Solved tickets data** | Local file `data/my_solved_tickets.json` | Yes — from `scripts/fetch_my_solved.py` (uses **DevRev API**); refreshed on schedule (e.g. 24h) and appended on Approve. |
+| **BM25 scoring** | Library `rank_bm25` | Optional; falls back to word-overlap if not installed. Corpus = title + body + **thread_text** (timeline). |
+| **Semantic search** | **OpenAI** embeddings | Optional. Set `retriever.use_embeddings: true` and `OPENAI_API_KEY` for vector similarity + `min_similarity` threshold. |
 
-**No external API is needed for retrieval itself.** Dry-run uses only local data and BM25.
+**Why two keys for "AI":** Claude is used for **chat/understanding** (one API). **Embeddings** are a different product; Anthropic does not offer them, so we use OpenAI for vector retrieval when you want better-than-BM25 matching and a similarity threshold.
+
+**When solved tickets have no "how I solved" in the thread:** We still match on title, body, and tags. Fetching timeline (default in `fetch_my_solved.py`) adds any comments that exist. Adding a resolution comment when closing (e.g. "Resolved via: order-trace-debugger") improves future retrieval.
 
 ---
 
@@ -46,18 +61,24 @@ You do **not** paste anything: the bot fetches tickets assigned to you, finds re
 
 ---
 
-## Optional (future)
+## Cron / scheduled fetch and permissions
+
+- **Scheduled solved fetch (e.g. every 24h):** Runs with the same **DEVREV_API_KEY**; no extra DevRev permission. No interactive "your permission" per run—the script runs as the process user with env vars.
+- **Slack:** Retrieval runs server-side (no Slack call). Only posting suggestions and reading thread replies need **channel access** for the bot; that is sufficient.
+
+---
+
+## Optional
 
 | What | API | Purpose |
 |------|-----|---------|
-| **Embeddings** | **OpenAI** or **Cohere** | Semantic search (better relevance) |
-| **Re-rank with Claude** | **Anthropic** (already used) | Pick top 10 from BM25 top-20 |
+| **Embeddings** | **OpenAI** — `OPENAI_API_KEY` | Semantic search; set `retriever.use_embeddings: true` and `min_similarity` (e.g. 0.5) to reduce misleading top-k. |
 
 ---
 
 ## Summary
 
-- **Bucket flow (no pasting):** **DevRev** + **Anthropic** + **Slack** (Bot + App token + `SLACK_BUCKET_CHANNEL_ID`).
-- **Retrieval (dry-run):** No API; needs `data/my_solved_tickets.json` (from DevRev fetch).
-- **Full suggest (CLI or Slack):** **Anthropic**.
-- **Slack bot:** **Slack** (Bot + App token).
+- **Bucket flow:** **DevRev** + **Anthropic** + **Slack** (Bot + App token + `SLACK_BUCKET_CHANNEL_ID`).
+- **Full AI experience:** You need **both** keys: **ANTHROPIC_API_KEY** (understanding + skill suggestion) and **OPENAI_API_KEY** (optional but recommended for semantic retrieval / embeddings). Anthropic does not provide an embedding API.
+- **Cron/scheduled fetch:** Use Slack command “fetch updated tickets” in the channel, or system cron; same **DEVREV_API_KEY**. **Slack:** channel access for the bot is enough.
+- **Single channel:** All ticket threads and bot commands (fetch tickets, help, future interactions) happen in the same Slack channel. See [ARCHITECTURE.md](ARCHITECTURE.md).
