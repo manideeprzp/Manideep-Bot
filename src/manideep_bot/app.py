@@ -28,6 +28,72 @@ logger = logging.getLogger(__name__)
 # Per-thread state: (channel_id, thread_ts) -> dict
 _thread_state = {}
 
+# ── DevRev PSE dropdown enums (from ctype__custom_type_fragment/17305) ───────
+_CAUSE_CODES = [
+    "Caused by Incident",
+    "Config Change",
+    "Dev Intervention - Code Debugging",
+    "Dev Intervention - Code Fix",
+    "Dev Intervention - Data Fix",
+    "Dev Intervention - Log/Tech Issue",
+    "Dev Intervention - Product Bug",
+    "Issue due to Internal stakeholder teams",
+    "Issue due to externals partners",
+    "No Response from Merchant/Business Teams",
+    "Not via Standard Channel",
+    "PSE - Code Debugging",
+    "PSE - Code Fix",
+    "PSE - Data Fix",
+    "PSE - Level-2 Issue(Invalid PSE Involvement)",
+    "PSE - Log/Tech Issue",
+    "PSE - Product Bug",
+    "Product Intervention - New Enhancement",
+]
+
+_BREACH_REASONS = [
+    "SLA Not Breached",
+    "Breached by Engineering",
+    "Breached by PSE",
+    "Delay Response from Merchant",
+    "Delay from Gateway / Bank / NPCI",
+    "Delay from Internal Teams",
+    "Delay in Deployment / PR / Approvals",
+    "Incorrect Priority / Severity by TS",
+    "Priority / Severity Upgraded",
+    "Ticket Reopened",
+]
+
+
+def _numbered_list(items: list) -> str:
+    return "\n".join(f"{i+1}. {v}" for i, v in enumerate(items))
+
+
+def _pick_from_list(text: str, options: list) -> str:
+    """
+    Match user input to an option list. Accepts:
+      - a number (1-based index)
+      - a partial case-insensitive string match
+    Returns the matched option string or "" if no match.
+    """
+    text = text.strip()
+    if not text or text.lower() in ("skip", "-", "none", "n/a"):
+        return ""
+    # Try numeric selection
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(options):
+            return options[idx]
+        return ""
+    # Partial string match (case-insensitive)
+    tl = text.lower()
+    for opt in options:
+        if tl == opt.lower():
+            return opt
+    for opt in options:
+        if tl in opt.lower():
+            return opt
+    return ""
+
 
 def _thread_key(event):
     ch = event.get("channel", "")
@@ -187,11 +253,10 @@ def _get_analysis(ticket_text: str, config, ticket_id: str = None, channel: str 
 
 def _handle_close_request(display_id: str, event: dict, say, config, thread_key: tuple):
     """
-    Start the close-ticket flow. Fetches the ticket and posts a fill-in template
-    asking for tags, cause_code, breach_reason, and a note — all in one thread reply.
+    Start the close-ticket flow. Fetches the ticket, shows current values and
+    numbered dropdown menus for cause_code + breach_reason, then waits for reply.
     """
     thread_ts = event.get("thread_ts") or event.get("ts")
-    channel = event.get("channel")
 
     from . import devrev_client
     say(text=f":hourglass_flowing_sand: Fetching `{display_id}`...", thread_ts=thread_ts)
@@ -206,18 +271,27 @@ def _handle_close_request(display_id: str, event: dict, say, config, thread_key:
     current_tags = devrev_client.get_tags_from_work(work)
     tag_names_str = ", ".join(f"`{t['name']}`" for t in current_tags) if current_tags else "_none_"
 
+    # Show current values if already set
+    cf = devrev_client.get_custom_fields_from_work(work)
+    current_cause = cf.get("ctype__cause_code", "")
+    current_breach = cf.get("ctype__reason_for_breach", "")
+
     prompt = (
         f":memo: Closing *{display_id}* — _{title}_\n"
-        f"Current stage: `{stage}` → will move to `{config.devrev.closed_stage_name}`\n"
-        f"Current tags: {tag_names_str}\n\n"
-        f"Reply with the fields below (all optional — leave a line blank or remove it to skip):\n"
+        f"Stage: `{stage}` → `{config.devrev.closed_stage_name}` | Tags: {tag_names_str}\n"
+        f"Current cause code: `{current_cause or 'not set'}` | Breach reason: `{current_breach or 'not set'}`\n\n"
+        f"*Cause Code* (pick a number or type partial name, or `skip`):\n"
+        f"```\n{_numbered_list(_CAUSE_CODES)}\n```\n\n"
+        f"*Breach Reason* (pick a number or type partial name, or `skip`):\n"
+        f"```\n{_numbered_list(_BREACH_REASONS)}\n```\n\n"
+        f"Reply with:\n"
         f"```\n"
+        f"cause_code: <number or name>\n"
+        f"breach_reason: <number or name>\n"
         f"tags: tag1, tag2\n"
-        f"cause_code: e.g. gc_fraud / gc_balance_issue / order_failure\n"
-        f"breach_reason: e.g. SLA missed — VPN routing issue\n"
-        f"note: Short resolution note posted on the ticket\n"
+        f"note: Short resolution note\n"
         f"```\n"
-        f"Or reply `confirm` to close immediately with just the `bot_resolved` tag."
+        f"All fields optional. Reply `confirm` to close with current values + `bot_resolved` tag."
     )
     say(text=prompt, thread_ts=thread_ts)
 
@@ -226,6 +300,8 @@ def _handle_close_request(display_id: str, event: dict, say, config, thread_key:
         "work_id": work_id,
         "display_id": display_id,
         "title": title,
+        "current_cause": current_cause,
+        "current_breach": current_breach,
     }
 
 
@@ -350,18 +426,21 @@ def run_slack_bot():
             tags_raw = _extract_field(text,
                 r"^tags?[\s:：]+(.+)$",
                 r"tags?[\s:：]+(.+)")
-            cause_code = _extract_field(text,
+            cause_raw = _extract_field(text,
                 r"^cause_?code[\s:：]+(.+)$",
                 r"cause_?code[\s:：]+(.+)")
-            breach_reason = _extract_field(text,
+            breach_raw = _extract_field(text,
                 r"^breach_?reason[\s:：]+(.+)$",
                 r"^reason_?for_?breach[\s:：]+(.+)$",
                 r"^breach[\s:：]+(.+)$",
-                r"breach_?reason[\s:：]+(.+)",
-                r"reason_?for_?breach[\s:：]+(.+)")
+                r"breach_?reason[\s:：]+(.+)")
             note = _extract_field(text,
                 r"^note[\s:：]+(.+)$",
                 r"note[\s:：]+(.+)")
+
+            # Resolve dropdown selections (number or partial string)
+            cause_code = _pick_from_list(cause_raw, _CAUSE_CODES) if cause_raw else state.get("current_cause", "")
+            breach_reason = _pick_from_list(breach_raw, _BREACH_REASONS) if breach_raw else state.get("current_breach", "")
 
             # Build tag list
             from . import devrev_client as dc
@@ -371,12 +450,18 @@ def run_slack_bot():
                     extra_tags.append({"name": t, "value": ""})
             tags_to_add = dc.build_tags_for_closure(extra_tags=extra_tags)
 
-            # Custom fields
+            # Custom fields — ctype__ fields go into the custom_fields nested dict via works.update
             custom_fields = {}
             if cause_code:
-                custom_fields["tnt__cause_code"] = cause_code
+                custom_fields["ctype__cause_code"] = cause_code
             if breach_reason:
-                custom_fields["tnt__reason_for_breach"] = breach_reason
+                custom_fields["ctype__reason_for_breach"] = breach_reason
+
+            # Warn if neither field resolved from input
+            if cause_raw and not cause_code:
+                say(text=f":warning: `{cause_raw}` didn't match any cause code — skipping. Reply `close {display_id}` to retry.", thread_ts=thread_ts)
+            if breach_raw and not breach_reason:
+                say(text=f":warning: `{breach_raw}` didn't match any breach reason — skipping. Reply `close {display_id}` to retry.", thread_ts=thread_ts)
 
             # Resolution comment
             summary = note or "Ticket closed via Manideep Bot close command."
@@ -397,10 +482,10 @@ def run_slack_bot():
                 tag_names = [t["name"] for t in tags_to_add]
                 confirm_parts = [
                     f":white_check_mark: *{display_id}* closed — stage set to `{config.devrev.closed_stage_name}`.",
-                    f"*Tags added:* {', '.join(f'`{t}`' for t in tag_names)}" if tag_names else "",
+                    f"*Tags:* {', '.join(f'`{t}`' for t in tag_names)}" if tag_names else "",
                     f"*Cause code:* `{cause_code}`" if cause_code else "",
-                    f"*Breach reason:* _{breach_reason}_" if breach_reason else "",
-                    f"*Note posted:* {note}" if note else "",
+                    f"*Breach reason:* `{breach_reason}`" if breach_reason else "",
+                    f"*Note posted:* _{note}_" if note else "",
                 ]
                 say(text="\n".join(p for p in confirm_parts if p), thread_ts=thread_ts)
             except Exception as e:
