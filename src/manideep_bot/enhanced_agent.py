@@ -17,26 +17,43 @@ from .retriever import find_relevant, format_relevant_for_prompt
 logger = logging.getLogger(__name__)
 
 # Pattern → skill mapping (keyword-based, used when no tag signal is available)
+# Order matters: more specific patterns first to avoid false positives
 ISSUE_PATTERNS = [
-    (re.compile(r"gc|gift.?card|card.?number", re.I), "gc-redemption-report"),
-    (re.compile(r"order.?id|order.?fail|reward.?order", re.I), "order-trace-debugger"),
-    (re.compile(r"cancel|cancell", re.I), "gc-cancellation"),
+    # DNS / Kong PR — must come before gc patterns (no overlap risk)
+    (re.compile(r"add\s+(dns|domain|route|cname)|vishnu|terraform.?kong|kong.?pr|cors.?origin|subdomain.*razorpay|razorpay\.com.*\bdomain\b", re.I), "vishnu-terraform-kong-pr"),
+    # GC cancellation — before redemption-report (cancel is more specific)
+    (re.compile(r"cancel\s+(gc|gift.?card|card)|gc\s+cancel|deactivate\s+(gc|gift.?card)", re.I), "gc-cancellation"),
+    # GC redemption report
+    (re.compile(r"gc|gift.?card|card.?number|redemption.?report", re.I), "gc-redemption-report"),
+    # Order trace
+    (re.compile(r"order.?id|order.?fail|reward.?order|order.?not\s+(visible|showing|found)", re.I), "order-trace-debugger"),
+    # Invalid rewards
     (re.compile(r"invalid.?reward|reward.?invalid", re.I), "invalid-rewards-debugger"),
-    (re.compile(r"rmp|gandalf", re.I), "rmp-gandalf"),
+    # RMP Gandalf
+    (re.compile(r"\brmp\b|gandalf", re.I), "rmp-gandalf"),
 ]
 
 # Tag → skill mapping (from solved issues — highest confidence signal)
 TAG_SKILL_MAP = {
+    # GC
     "redemption_report": "gc-redemption-report",
     "gc_redemption": "gc-redemption-report",
     "gc_cancellation": "gc-cancellation",
     "gc_cancel": "gc-cancellation",
+    # Orders
     "order_trace": "order-trace-debugger",
     "order_debug": "order-trace-debugger",
+    # Others
     "invalid_rewards": "invalid-rewards-debugger",
     "rmp_gandalf": "rmp-gandalf",
     "rmp_order": "rmp-gandalf",
     "voucher_upload": "voucher-benefit-upload",
+    # DNS / Kong PR
+    "dns_pr": "vishnu-terraform-kong-pr",
+    "kong_pr": "vishnu-terraform-kong-pr",
+    "dns_record": "vishnu-terraform-kong-pr",
+    "cors_origin": "vishnu-terraform-kong-pr",
+    "engage_loyalty_dns": "vishnu-terraform-kong-pr",
 }
 
 

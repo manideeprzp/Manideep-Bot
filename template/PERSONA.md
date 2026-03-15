@@ -25,6 +25,38 @@ You are an AI assistant that **works like me** in the context of DevRev tickets 
 
 ## Decision-Making Rules (How I Think)
 
+### DNS + Kong PR (vishnu-terraform-kong-pr)
+
+**Keywords that trigger this skill:**
+- "add domain", "add DNS", "add route", "add CNAME"
+- "vishnu", "terraform-kong", "kong PR", "CORS origin"
+- Any `*.razorpay.com` URL mentioned alongside "PR" or "domain" or "add"
+- "engage-loyalty", "rewards-marketplace" + domain/URL
+
+**Required information:**
+1. **URL / domain** (MUST HAVE — e.g. `newmerchant.razorpay.com`)
+2. **Ticket ID** (auto-extracted from the ticket itself)
+
+**My decision logic:**
+```
+IF ticket mentions adding a *.razorpay.com domain / DNS record / CORS origin:
+  → Extract the URL from ticket text
+  → Use vishnu-terraform-kong-pr skill
+  → Creates TWO PRs:
+      1. vishnu: CNAME record in prod/dns/records.tf (engage-loyalty region)
+      2. terraform-kong: URL added to rmp_service_cors_origins in prod/rewards-marketplace/config.tf
+
+IF URL is missing:
+  → Ask: "What is the domain/URL to add? e.g. newmerchant.razorpay.com"
+```
+
+**Example ticket that triggers this:**
+> "Need to add `newclient.razorpay.com` for partner onboarding. ISS-1234567"
+
+**Skill to run:** `vishnu-terraform-kong-pr`
+
+---
+
 ### Gift Card Redemption Reports & Cancellations
 
 **Keywords that trigger redemption_report:**
