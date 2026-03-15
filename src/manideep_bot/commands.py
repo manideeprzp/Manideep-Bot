@@ -83,7 +83,15 @@ def _run_fetch_updated_tickets(config) -> str:
 def get_commands_help() -> str:
     """Short help for supported commands (for bot reply when user says 'help' or similar)."""
     return (
-        "*Commands (say in channel or thread):*\n"
-        "• `fetch updated tickets` / `refresh solved tickets` — Quick refresh from DevRev (no timeline, so it doesn’t time out). For full refresh with thread text, run `python3 scripts/fetch_my_solved.py` locally or via cron.\n"
-        "• Paste a ticket ID or description — I'll suggest an approach and skill; reply *Yes* then *Approve* in thread."
+        "*Commands (say in channel or thread):*\n\n"
+        "*Close a ticket directly:*\n"
+        "- `close ISS-XXXXXX` -- Start the close flow. Bot fetches the ticket and prompts for:\n"
+        "  `tags:` `cause_code:` `breach_reason:` `note:` (all optional)\n"
+        "  Reply `confirm` to close immediately with just `bot_resolved` tag.\n\n"
+        "*Analyze a ticket:*\n"
+        "- Paste a ticket ID or description -- I'll suggest an approach and skill.\n"
+        "  Reply *Yes* to run the skill, then *Approve* to post resolution + close.\n\n"
+        "*Fetch tickets:*\n"
+        "- `fetch updated tickets` / `refresh solved tickets` -- Quick refresh from DevRev.\n"
+        "  For full refresh run `python3 scripts/fetch_my_solved.py` locally."
     )

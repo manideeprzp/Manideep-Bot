@@ -125,6 +125,27 @@ def _parse_skill_name(text):
     return None
 
 
+def _parse_close_command(text: str):
+    """Detect 'close ISS-XXXXXX' command. Returns display_id (uppercase) or None."""
+    if not text:
+        return None
+    m = re.match(r"^close\s+((?:ISS|ISSUE)-\d+)\b", text.strip(), re.I)
+    if m:
+        return m.group(1).upper().replace("ISSUE-", "ISS-")
+    return None
+
+
+def _extract_field(text: str, *patterns) -> str:
+    """Extract a value from a structured reply using one or more regex patterns."""
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I | re.MULTILINE)
+        if m:
+            for g in (m.groups() or []):
+                if g and g.strip():
+                    return g.strip()
+    return ""
+
+
 def _is_unassigned(work: dict, svcacc_id: str) -> bool:
     """
     Return True if the ticket is effectively unassigned.
@@ -162,6 +183,50 @@ def _get_analysis(ticket_text: str, config, ticket_id: str = None, channel: str 
     else:
         logger.info("No API key - using Claude Code local analysis")
         return claude_code_reply(ticket_text, config, ticket_id, channel, thread_ts)
+
+
+def _handle_close_request(display_id: str, event: dict, say, config, thread_key: tuple):
+    """
+    Start the close-ticket flow. Fetches the ticket and posts a fill-in template
+    asking for tags, cause_code, breach_reason, and a note — all in one thread reply.
+    """
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    channel = event.get("channel")
+
+    from . import devrev_client
+    say(text=f":hourglass_flowing_sand: Fetching `{display_id}`...", thread_ts=thread_ts)
+    work = devrev_client.get_work_by_display_id(display_id)
+    if not work:
+        say(text=f":x: Could not find ticket `{display_id}` in DevRev.", thread_ts=thread_ts)
+        return
+
+    work_id = work.get("id", "")
+    title = (work.get("title") or "")[:120]
+    stage = ((work.get("stage") or {}).get("name") or "unknown")
+    current_tags = devrev_client.get_tags_from_work(work)
+    tag_names_str = ", ".join(f"`{t['name']}`" for t in current_tags) if current_tags else "_none_"
+
+    prompt = (
+        f":memo: Closing *{display_id}* — _{title}_\n"
+        f"Current stage: `{stage}` → will move to `{config.devrev.closed_stage_name}`\n"
+        f"Current tags: {tag_names_str}\n\n"
+        f"Reply with the fields below (all optional — leave a line blank or remove it to skip):\n"
+        f"```\n"
+        f"tags: tag1, tag2\n"
+        f"cause_code: e.g. gc_fraud / gc_balance_issue / order_failure\n"
+        f"breach_reason: e.g. SLA missed — VPN routing issue\n"
+        f"note: Short resolution note posted on the ticket\n"
+        f"```\n"
+        f"Or reply `confirm` to close immediately with just the `bot_resolved` tag."
+    )
+    say(text=prompt, thread_ts=thread_ts)
+
+    _thread_state[thread_key] = {
+        "step": "awaiting_close_info",
+        "work_id": work_id,
+        "display_id": display_id,
+        "title": title,
+    }
 
 
 def run_slack_bot():
@@ -218,6 +283,12 @@ def run_slack_bot():
             say(text=reply_text, thread_ts=thread_ts)
             return
 
+        # ── Close command: @bot close ISS-XXXXXX ─────────────────────────────
+        close_id = _parse_close_command(text)
+        if close_id:
+            _handle_close_request(close_id, event, say, config, _thread_key(event))
+            return
+
         say(text=":hourglass_flowing_sand: Analysing...", thread_ts=thread_ts)
         try:
             channel = event.get("channel")
@@ -269,6 +340,78 @@ def run_slack_bot():
 
         text = (event.get("text") or "").strip()
         cmd = _normalize_approve(text)
+
+        # ── Close-ticket flow ─────────────────────────────────────────────────
+        if state.get("step") == "awaiting_close_info":
+            work_id = state.get("work_id", "")
+            display_id = state.get("display_id", "")
+
+            # Parse structured fields from the reply
+            tags_raw = _extract_field(text,
+                r"^tags?[\s:：]+(.+)$",
+                r"tags?[\s:：]+(.+)")
+            cause_code = _extract_field(text,
+                r"^cause_?code[\s:：]+(.+)$",
+                r"cause_?code[\s:：]+(.+)")
+            breach_reason = _extract_field(text,
+                r"^breach_?reason[\s:：]+(.+)$",
+                r"^reason_?for_?breach[\s:：]+(.+)$",
+                r"^breach[\s:：]+(.+)$",
+                r"breach_?reason[\s:：]+(.+)",
+                r"reason_?for_?breach[\s:：]+(.+)")
+            note = _extract_field(text,
+                r"^note[\s:：]+(.+)$",
+                r"note[\s:：]+(.+)")
+
+            # Build tag list
+            from . import devrev_client as dc
+            extra_tags = []
+            if tags_raw:
+                for t in [x.strip() for x in re.split(r"[,;]", tags_raw) if x.strip()]:
+                    extra_tags.append({"name": t, "value": ""})
+            tags_to_add = dc.build_tags_for_closure(extra_tags=extra_tags)
+
+            # Custom fields
+            custom_fields = {}
+            if cause_code:
+                custom_fields["tnt__cause_code"] = cause_code
+            if breach_reason:
+                custom_fields["tnt__reason_for_breach"] = breach_reason
+
+            # Resolution comment
+            summary = note or "Ticket closed via Manideep Bot close command."
+            resolution_comment = dc.build_resolution_comment(summary=summary)
+
+            try:
+                dc.work_update_full(
+                    work_id=work_id,
+                    stage_name=config.devrev.closed_stage_name,
+                    tags_to_add=tags_to_add,
+                    comment=resolution_comment,
+                    custom_fields=custom_fields if custom_fields else None,
+                )
+
+                from .monitor import append_solved_ticket_after_approve
+                append_solved_ticket_after_approve(config, work_id)
+
+                tag_names = [t["name"] for t in tags_to_add]
+                confirm_parts = [
+                    f":white_check_mark: *{display_id}* closed — stage set to `{config.devrev.closed_stage_name}`.",
+                    f"*Tags added:* {', '.join(f'`{t}`' for t in tag_names)}" if tag_names else "",
+                    f"*Cause code:* `{cause_code}`" if cause_code else "",
+                    f"*Breach reason:* _{breach_reason}_" if breach_reason else "",
+                    f"*Note posted:* {note}" if note else "",
+                ]
+                say(text="\n".join(p for p in confirm_parts if p), thread_ts=thread_ts)
+            except Exception as e:
+                logger.exception("Close ticket failed for %s", display_id)
+                say(text=f":x: Failed to close `{display_id}`: {e}", thread_ts=thread_ts)
+
+            if is_bucket:
+                bucket_mod.pop_bucket_thread_state(ch, thread_ts)
+            else:
+                _thread_state.pop(key, None)
+            return
 
         if cmd == "yes" and state.get("step") == "suggested":
             from . import skill_runner
