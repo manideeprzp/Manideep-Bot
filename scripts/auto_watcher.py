@@ -1,264 +1,255 @@
 #!/usr/bin/env python3
 """
-Auto-watcher for Claude Code integration.
+Auto-watcher: fully automatic ticket analysis — no Cursor/Claude Code typing needed.
 
-Watches the analysis queue directory and automatically analyzes new tickets
-using Claude Code's capabilities (past ticket search, pattern matching, etc.).
+Watches data/claude_requests/*.md for new ticket analysis requests written by the bot,
+generates analysis using detect_skill() + past solved tickets, writes response to
+data/claude_responses/<ticket_id>.md, which response_watcher.py picks up and posts to Slack.
 
-Run this in the background:
-    python scripts/auto_watcher.py
+Run in background:
+    nohup .venv/bin/python scripts/auto_watcher.py > logs/auto_watcher.log 2>&1 &
 
-Or use the shell wrapper:
-    ./scripts/run_auto_watcher.sh
+The complete zero-intervention flow:
+    Ticket arrives in Slack
+        → bot writes data/claude_requests/ISS-XXXXXX.md
+        → auto_watcher detects it (within 5 seconds)
+        → generates analysis + skill suggestion
+        → writes data/claude_responses/ISS-XXXXXX.md
+        → response_watcher posts analysis to Slack
+        → bot auto-runs safe skills immediately
+        → you just reply Approve to close
 """
-
-import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
 
-# Add parent directory to path
+# Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from manideep_bot.config import load_config
-from manideep_bot.retriever import find_relevant
-from manideep_bot.enhanced_agent import IssuePattern, extract_structured_data
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s %(levelname)s auto_watcher — %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+BOT_ROOT = Path(__file__).resolve().parent.parent
+REQUESTS_DIR = BOT_ROOT / "data" / "claude_requests"
+RESPONSES_DIR = BOT_ROOT / "data" / "claude_responses"
 
-def analyze_ticket_automatically(ticket_file: Path, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Automatically analyze a ticket using Claude Code's capabilities.
 
-    This mimics what Claude Code would do:
-    1. Read the ticket
-    2. Search past solved tickets
-    3. Detect patterns
-    4. Extract structured data
-    5. Generate analysis with confidence
+def _load_deps():
+    """Import bot modules (lazy so env is loaded first)."""
+    from manideep_bot.enhanced_agent import detect_skill
+    from manideep_bot.retriever import find_relevant, format_relevant_for_prompt
+    from manideep_bot.config import load_config
+    return detect_skill, find_relevant, format_relevant_for_prompt, load_config
+
+
+def _extract_ticket_text(md_content: str) -> tuple[str, str]:
+    """Extract ticket_id and full text from a claude_requests .md file."""
+    ticket_id = ""
+    # Title line: # Ticket Analysis Request: ISS-XXXXXX
+    m = re.search(r"ISS-\d+", md_content)
+    if m:
+        ticket_id = m.group(0)
+
+    # Extract the ticket body between markers
+    text_parts = []
+    capture = False
+    for line in md_content.splitlines():
+        if line.startswith("## Ticket:") or line.startswith("## Issue:") or line.startswith("**Title"):
+            capture = True
+        if capture:
+            text_parts.append(line)
+        if capture and line.startswith("## Similar") :
+            break
+
+    return ticket_id, "\n".join(text_parts) if text_parts else md_content
+
+
+def analyze(request_file: Path, detect_skill, find_relevant, format_relevant, config) -> str:
     """
+    Read a request .md file and generate a full analysis response.
+    Returns the response as a markdown string matching the bot's expected format.
+    """
+    content = request_file.read_text()
+    ticket_id = request_file.stem  # filename is ISS-XXXXXX.md
+    ticket_text = content  # pass full content for richer matching
+
+    # Detect skill via keyword matching
+    skill_name, confidence = detect_skill(ticket_text)
+    skill_name = skill_name or "none"
+    conf_label = confidence if confidence else "low"
+
+    # Find similar past solved tickets
+    similar_context = ""
+    suggested_tags = []
     try:
-        # Read ticket
-        with open(ticket_file) as f:
-            ticket_data = json.load(f)
-
-        ticket_id = ticket_data.get("ticket_id", "Unknown")
-        ticket_text = ticket_data.get("text", "")
-
-        logger.info(f"Auto-analyzing ticket {ticket_id}...")
-
-        # 1. Search past solved tickets
-        relevant_tickets = find_relevant(ticket_text, config, top_k=10)
-
-        # 2. Detect issue pattern
-        issue_type = IssuePattern.detect_issue_type(ticket_text)
-
-        # 3. Extract structured data
-        structured_data = extract_structured_data(ticket_text, issue_type)
-
-        # 4. Calculate confidence based on:
-        # - Pattern match strength
-        # - Number of relevant past tickets
-        # - Completeness of extracted data
-        confidence = 0.0
-
-        if issue_type != "general":
-            confidence += 0.3  # Pattern detected
-
-        if relevant_tickets:
-            # More relevant tickets = higher confidence
-            confidence += min(0.4, len(relevant_tickets) * 0.04)
-
-        # Check data completeness
-        required_fields = structured_data.get("required_data", {})
-        if required_fields:
-            found = sum(1 for v in required_fields.values() if v)
-            total = len(required_fields)
-            confidence += (found / total) * 0.3
-
-        confidence = min(confidence, 0.95)  # Cap at 95%
-
-        # 5. Determine skill to run
-        skill_name = None
-        if issue_type == "gc_redemption":
-            skill_name = "gc-redemption-report"
-        elif issue_type == "order_trace":
-            skill_name = "order-trace"
-        elif issue_type == "booking_check":
-            skill_name = "booking-status"
-        elif relevant_tickets and relevant_tickets[0].get("score", 0) > 0.7:
-            # High similarity to past ticket - use same skill
-            past_ticket = relevant_tickets[0]
-            skill_name = past_ticket.get("skill_used") or past_ticket.get("title", "").lower().replace(" ", "-")
-
-        # 6. Build analysis text
-        analysis_parts = []
-
-        # Confidence indicator
-        if confidence >= 0.8:
-            analysis_parts.append(f"🟢 Confidence: {int(confidence * 100)}%")
-        elif confidence >= 0.5:
-            analysis_parts.append(f"🟡 Confidence: {int(confidence * 100)}%")
-        else:
-            analysis_parts.append(f"🔴 Confidence: {int(confidence * 100)}%")
-
-        analysis_parts.append("")
-
-        # Analysis
-        analysis_parts.append("**Analysis:**")
-        if issue_type != "general":
-            analysis_parts.append(f"Issue type: {issue_type.replace('_', ' ').title()}")
-
-        if structured_data.get("summary"):
-            analysis_parts.append(structured_data["summary"])
-        else:
-            analysis_parts.append(f"Based on the ticket description, this appears to be a {issue_type.replace('_', ' ')} issue.")
-
-        analysis_parts.append("")
-
-        # Relevant past tickets
-        if relevant_tickets:
-            analysis_parts.append("**Similar past tickets:**")
-            for i, ticket in enumerate(relevant_tickets[:3], 1):
-                ticket_ref = ticket.get("id", "Unknown")
-                score = ticket.get("score", 0)
-                analysis_parts.append(f"{i}. {ticket_ref} (similarity: {int(score * 100)}%)")
-            analysis_parts.append("")
-
-        # Required data
-        if required_fields:
-            analysis_parts.append("**Required data:**")
-            for field, value in required_fields.items():
-                status = "✓" if value else "✗"
-                analysis_parts.append(f"{status} {field}: {value if value else 'Not found'}")
-            analysis_parts.append("")
-
-        # Skill to run
-        if skill_name:
-            analysis_parts.append(f"**Skill to run:** {skill_name}")
-            analysis_parts.append("")
-
-        # Recommendation
-        recommendation = "ask_approval"  # Default: always ask
-        if confidence >= 0.9 and all(required_fields.values()):
-            recommendation = "high_confidence"
-        elif confidence < 0.5:
-            recommendation = "manual_review"
-
-        analysis_parts.append(f"**Recommendation:** {recommendation.replace('_', ' ').title()}")
-        analysis_parts.append("")
-        analysis_parts.append("---")
-        analysis_parts.append("")
-        analysis_parts.append("Reply **Yes** to run the skill, or **No** to cancel.")
-
-        # 7. Create response
-        response = {
-            "timestamp": ticket_data.get("timestamp"),
-            "ticket_id": ticket_id,
-            "status": "completed",
-            "analyzed_at": datetime.now().isoformat(),
-            "analysis": "\n".join(analysis_parts),
-            "metadata": {
-                "issue_type": issue_type,
-                "skill_name": skill_name,
-                "confidence": confidence,
-                "recommendation": recommendation,
-                "relevant_tickets_count": len(relevant_tickets),
-                "auto_analyzed": True
-            }
-        }
-
-        return response
-
+        relevant = find_relevant(ticket_text, config, top_k=5)
+        similar_context = format_relevant(relevant, max_items=5)
+        # Extract tags from similar tickets
+        for item in (relevant or []):
+            for tag in (item.get("tag_names") or item.get("tags") or []):
+                t = tag.strip() if isinstance(tag, str) else (tag.get("name") or "")
+                if t and t not in suggested_tags:
+                    suggested_tags.append(t)
     except Exception as e:
-        logger.error(f"Error analyzing ticket {ticket_file}: {e}", exc_info=True)
-        return None
+        logger.debug("Retriever error: %s", e)
+
+    # Build approach steps based on skill
+    approach_steps = _build_approach(skill_name, ticket_text)
+
+    # Build suggested tags
+    if skill_name and skill_name != "none":
+        skill_tag = f"skill:{skill_name}"
+        if skill_tag not in suggested_tags:
+            suggested_tags.insert(0, skill_tag)
+
+    tags_str = ", ".join(f"`{t}`" for t in suggested_tags[:6]) if suggested_tags else "_none_"
+
+    # Build analysis summary
+    summary = _build_summary(skill_name, ticket_text, ticket_id)
+
+    response = (
+        f"**Analysis:** {summary}\n\n"
+        f"**Approach:**\n{approach_steps}\n\n"
+        f"**Skill to run:** {skill_name}\n"
+        f"**Confidence:** {conf_label}\n\n"
+        f"**Suggested tags:** {tags_str}\n"
+        f"**Suggested fields:** cause_code: (set on close), pse_pod: (set on close), severity: Sev-4\n"
+    )
+
+    if similar_context:
+        response += f"\n**Similar past tickets:**\n{similar_context}\n"
+
+    response += "\nReply *Yes* to run the skill, or *Approve* if already reviewed."
+
+    return response
 
 
-def watch_queue(config: Dict[str, Any], interval: int = 5):
-    """
-    Watch the analysis queue directory and automatically analyze new tickets.
+def _build_summary(skill_name: str, text: str, ticket_id: str) -> str:
+    """Generate a 1-2 sentence analysis summary."""
+    text_lower = text.lower()
+    if skill_name == "gc-redemption-report":
+        card_m = re.search(r"\b(GC[A-Z0-9]{6,}|[A-Z]{2}[0-9]{9,})\b", text)
+        card = card_m.group(0) if card_m else "provided card"
+        return f"Customer has a gift card issue for {card}. Running redemption report to check balance and transaction history."
+    if skill_name == "gc-cancellation":
+        return "Gift card cancellation requested. Will verify card status and proceed with cancellation after confirming reason."
+    if skill_name == "order-trace-debugger":
+        order_m = re.search(r"order[_\s-]?id[\s:=]+([A-Za-z0-9_-]+)", text, re.I)
+        order_id = order_m.group(1) if order_m else "the order"
+        return f"Order issue detected for {order_id}. Tracing through RMP, Offers Engine, and Procurement systems."
+    if skill_name == "vishnu-terraform-kong-pr":
+        url_m = re.search(r"([a-zA-Z0-9_-]+\.razorpay\.com)", text)
+        url = url_m.group(1) if url_m else "the requested domain"
+        return f"DNS and CORS origin setup required for {url}. Will create PRs in vishnu (DNS record) and terraform-kong (CORS origin)."
+    if skill_name == "invalid-rewards-debugger":
+        return "Invalid rewards issue detected. Debugging reward eligibility and configuration."
+    if skill_name == "rmp-gandalf":
+        return "RMP Gandalf access or permission issue. Checking authorization configuration."
+    return f"Ticket {ticket_id} received. Analysing based on past solved tickets and issue patterns."
 
-    Args:
-        config: Bot configuration
-        interval: Check interval in seconds
-    """
-    queue_dir = Path("data/analysis_queue")
-    queue_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"🤖 Auto-watcher started. Watching {queue_dir}")
-    logger.info(f"Checking every {interval} seconds...")
+def _build_approach(skill_name: str, text: str) -> str:
+    """Generate numbered approach steps for the skill."""
+    if skill_name == "gc-redemption-report":
+        return (
+            "1. Run `gc-redemption-report` with the card number\n"
+            "2. Check transactions — if only recharge entries → full balance → cancellation case\n"
+            "3. If redemptions found → card was used → share the report\n"
+            "4. Update ticket with findings"
+        )
+    if skill_name == "gc-cancellation":
+        return (
+            "1. Verify cancellation reason is present\n"
+            "2. Run `gc-cancellation` with card number + reason\n"
+            "3. Confirm cancellation in GCOMS\n"
+            "4. Update ticket with cancellation confirmation"
+        )
+    if skill_name == "order-trace-debugger":
+        return (
+            "1. Run `order-trace-debugger` with the order_id\n"
+            "2. Check order state and customer-to-order mapping\n"
+            "3. Verify visibility flags and permissions\n"
+            "4. Review state transitions for anomalies"
+        )
+    if skill_name == "vishnu-terraform-kong-pr":
+        url_m = re.search(r"([a-zA-Z0-9_-]+\.razorpay\.com)", text)
+        url = url_m.group(1) if url_m else "the domain"
+        return (
+            f"1. Run `vishnu-terraform-kong-pr` with URL: `{url}`\n"
+            "2. vishnu: Add CNAME record in `prod/dns/records.tf` (engage-loyalty region)\n"
+            "3. terraform-kong: Append URL to `rmp_service_cors_origins` in `prod/rewards-marketplace/config.tf`\n"
+            "4. Both PRs created and linked — reply Approve to close ticket"
+        )
+    if skill_name == "invalid-rewards-debugger":
+        return (
+            "1. Run `invalid-rewards-debugger`\n"
+            "2. Check reward eligibility rules and configuration\n"
+            "3. Identify root cause of invalid reward\n"
+            "4. Update ticket with findings"
+        )
+    return (
+        "1. Review ticket details carefully\n"
+        "2. Check similar past solved tickets for pattern\n"
+        "3. Determine correct action and run appropriate skill\n"
+        "4. Update ticket with resolution"
+    )
+
+
+def watch(interval: int = 5):
+    """Main watch loop — runs forever, checking every `interval` seconds."""
+    REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
+    RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Auto-watcher started — watching %s", REQUESTS_DIR)
+
+    try:
+        detect_skill, find_relevant, format_relevant, load_config = _load_deps()
+        config = load_config()
+    except Exception as e:
+        logger.error("Failed to load bot modules: %s", e)
+        sys.exit(1)
 
     processed = set()
 
     while True:
         try:
-            # Find pending tickets (no response file yet)
-            ticket_files = list(queue_dir.glob("ticket_*.json"))
-
-            for ticket_file in ticket_files:
-                # Skip if already processed
-                if ticket_file in processed:
+            for req_file in sorted(REQUESTS_DIR.glob("ISS-*.md")):
+                if req_file in processed:
                     continue
 
-                # Check if response already exists
-                response_file = ticket_file.parent / f"{ticket_file.stem}_response.json"
-                if response_file.exists():
-                    processed.add(ticket_file)
+                resp_file = RESPONSES_DIR / req_file.name
+                if resp_file.exists():
+                    processed.add(req_file)
                     continue
 
-                # New ticket - analyze it!
-                logger.info(f"📬 New ticket detected: {ticket_file.name}")
+                logger.info("New request: %s — analysing...", req_file.name)
+                try:
+                    response_text = analyze(req_file, detect_skill, find_relevant, format_relevant, config)
+                    resp_file.write_text(response_text)
+                    logger.info("Response written: %s", resp_file.name)
+                except Exception as e:
+                    logger.error("Failed to analyse %s: %s", req_file.name, e)
 
-                response = analyze_ticket_automatically(ticket_file, config)
+                processed.add(req_file)
 
-                if response:
-                    # Write response
-                    with open(response_file, "w") as f:
-                        json.dump(response, f, indent=2)
-
-                    logger.info(f"✅ Analysis complete: {response_file.name}")
-                    logger.info(f"   Confidence: {response['metadata']['confidence']:.0%}")
-                    logger.info(f"   Skill: {response['metadata'].get('skill_name', 'None')}")
-                else:
-                    logger.error(f"❌ Failed to analyze {ticket_file.name}")
-
-                processed.add(ticket_file)
-
-            # Sleep
             time.sleep(interval)
 
         except KeyboardInterrupt:
-            logger.info("🛑 Auto-watcher stopped by user")
+            logger.info("Auto-watcher stopped.")
             break
         except Exception as e:
-            logger.error(f"Error in watch loop: {e}", exc_info=True)
+            logger.error("Watch loop error: %s", e)
             time.sleep(interval)
 
 
-def main():
-    """Main entry point."""
-    try:
-        # Load config
-        config = load_config()
-
-        # Watch queue
-        watch_queue(config, interval=5)
-
-    except KeyboardInterrupt:
-        logger.info("Goodbye!")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    watch()
