@@ -13,6 +13,7 @@ _CURSOR_SKILLS_ROOT = Path.home() / ".cursor" / "skills"
 _ORDER_TRACE_SCRIPT = _BOT_ROOT / "scripts" / "trace_order.py"
 _GC_REDEMPTION_SCRIPT = _CURSOR_SKILLS_ROOT / "gc-redemption-report" / "scripts" / "redemption_report.py"
 _GC_CANCELLATION_SCRIPT = _CURSOR_SKILLS_ROOT / "gc-cancellation" / "scripts" / "cancel_gc.py"
+_VISHNU_KONG_SCRIPT = _BOT_ROOT / "scripts" / "vishnu_kong_pr.py"
 
 # Fallback: order-trace-debugger in Cursor skills
 _ORDER_TRACE_CURSOR = _CURSOR_SKILLS_ROOT / "order-trace-debugger" / "scripts" / "trace_order.py"
@@ -53,6 +54,21 @@ def _find_card_number(text: str) -> str:
             if pat.startswith(r"GC"):
                 return f"GC{card}" if not card.startswith("GC") else card
             return card
+    return ""
+
+
+def _find_url(text: str) -> str:
+    """Extract a domain/URL from ticket text (e.g. simplysave.razorpay.com)."""
+    if not text:
+        return ""
+    # Full https URL
+    m = re.search(r"https?://([a-zA-Z0-9._-]+\.razorpay\.com)\b", text, re.I)
+    if m:
+        return m.group(1)
+    # Bare razorpay.com subdomain
+    m = re.search(r"\b([a-zA-Z0-9_-]+\.razorpay\.com)\b", text, re.I)
+    if m:
+        return m.group(1)
     return ""
 
 
@@ -162,5 +178,41 @@ def run_skill(skill_name: str, ticket_text: str) -> tuple[str, bool]:
         except Exception as e:
             return str(e)[:500], False
 
+    # Vishnu + Terraform-Kong dual PR
+    elif skill_name in ("vishnu-terraform-kong-pr", "vishnu-kong-pr", "kong-pr", "dns-pr"):
+        url = _find_url(ticket_text)
+        if not url:
+            return (
+                "Could not find a `*.razorpay.com` URL in the ticket.\n"
+                "Please reply with the domain, e.g.:\n`url: simplysave.razorpay.com`"
+            ), False
+
+        # Extract ticket ID from ticket text (ISS-XXXXXX)
+        ticket_id_match = re.search(r"\b(ISS-\d+)\b", ticket_text, re.I)
+        ticket_id = ticket_id_match.group(1).upper() if ticket_id_match else "ISS-000000"
+
+        if not _VISHNU_KONG_SCRIPT.exists():
+            return f"Script not found: {_VISHNU_KONG_SCRIPT}", False
+
+        try:
+            import sys
+            py = sys.executable or "python3"
+            out = subprocess.run(
+                [py, str(_VISHNU_KONG_SCRIPT), url, ticket_id],
+                capture_output=True,
+                text=True,
+                timeout=300,  # git ops can be slow
+                cwd=str(_BOT_ROOT),
+            )
+            output = (out.stdout or "").strip()
+            if out.returncode != 0:
+                err = (out.stderr or out.stdout or "Script failed").strip()
+                return err[:3000], False
+            return output[:3000], True
+        except subprocess.TimeoutExpired:
+            return "PR script timed out (300s). Check if repos are accessible.", False
+        except Exception as e:
+            return str(e)[:500], False
+
     # Unknown skill
-    return f"No runnable skill for '{skill_name}'. Available skills: order-trace-debugger, gc-redemption-report, gc-cancellation.", False
+    return f"No runnable skill for '{skill_name}'. Available skills: order-trace-debugger, gc-redemption-report, gc-cancellation, vishnu-terraform-kong-pr.", False
