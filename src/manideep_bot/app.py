@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 # Per-thread state: (channel_id, thread_ts) -> dict
 _thread_state = {}
 
+# Skills safe to auto-run when ticket arrives (no "Yes" needed).
+# These are read-only or reversible — output is reviewed before closing.
+# Destructive skills (gc-cancellation, rmp-gandalf) are NOT here → always manual.
+_AUTO_RUN_SKILLS = {
+    "gc-redemption-report",
+    "order-trace-debugger",
+    "vishnu-terraform-kong-pr",
+    "invalid-rewards-debugger",
+}
+
 # ── DevRev PSE dropdown enums (from ctype__custom_type_fragment/17305) ───────
 _CAUSE_CODES = [
     "Caused by Incident",
@@ -709,14 +719,68 @@ def run_slack_bot():
             else:
                 _post_formatted(client, bucket_ch, posted_ts, display_id, response)
 
-            bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
-                "step": "suggested",
-                "work_id": work_id,
-                "display_id": display_id,
-                "ticket_text": ticket_text,
-                "skill_name": skill_name,
-            })
-            logger.info("Posted analysis for %s in bucket channel %s (assigned=%s)", display_id, bucket_ch, assigned_now)
+            # ── Auto-run safe skills immediately (no "Yes" needed) ────────────
+            if skill_name in _AUTO_RUN_SKILLS:
+                logger.info("Auto-running skill '%s' for %s", skill_name, display_id)
+                client.chat_postMessage(
+                    channel=bucket_ch,
+                    thread_ts=posted_ts,
+                    text=f":robot_face: *Auto-running* `{skill_name}` — no approval needed for this skill...",
+                )
+                from . import skill_runner
+                out, ok = skill_runner.run_skill(skill_name, ticket_text)
+                if ok:
+                    client.chat_postMessage(
+                        channel=bucket_ch,
+                        thread_ts=posted_ts,
+                        text=(
+                            f":white_check_mark: Skill `{skill_name}` completed.\n"
+                            f"```\n{out[:2500]}\n```\n\n"
+                            f"Review the output above. Reply *Approve* to post this on the ticket and close it, "
+                            f"or *No* to cancel."
+                        ),
+                    )
+                    bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                        "step": "pending_approve",
+                        "work_id": work_id,
+                        "display_id": display_id,
+                        "ticket_text": ticket_text,
+                        "skill_name": skill_name,
+                        "output": out,
+                        "summary": out[:500],
+                    })
+                else:
+                    # Skill failed (e.g. missing card number) — fall back to manual
+                    client.chat_postMessage(
+                        channel=bucket_ch,
+                        thread_ts=posted_ts,
+                        text=(
+                            f":warning: Auto-run failed: {out}\n\n"
+                            f"Please reply *Yes* after adding the missing info to run manually."
+                        ),
+                    )
+                    bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                        "step": "suggested",
+                        "work_id": work_id,
+                        "display_id": display_id,
+                        "ticket_text": ticket_text,
+                        "skill_name": skill_name,
+                    })
+            else:
+                # Manual skill — wait for "Yes"
+                bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                    "step": "suggested",
+                    "work_id": work_id,
+                    "display_id": display_id,
+                    "ticket_text": ticket_text,
+                    "skill_name": skill_name,
+                })
+
+            logger.info(
+                "Processed %s in bucket channel %s (skill=%s, auto=%s, assigned=%s)",
+                display_id, bucket_ch, skill_name,
+                skill_name in _AUTO_RUN_SKILLS, assigned_now,
+            )
         except Exception as e:
             logger.exception("Notification handler error for %s: %s", display_id, e)
         return True
