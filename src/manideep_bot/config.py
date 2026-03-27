@@ -68,8 +68,9 @@ class DevRevConfig:
 class MonitorConfig:
     enabled: bool = False
     interval_minutes: int = 20
-    new_ticket_filter_parts: list = None  # applies_to_part IDs (optional if part_names set)
-    new_ticket_filter_part_names: list = None  # part names, resolved to IDs via DevRev parts.list (e.g. "distribution channel and reseller")
+    new_ticket_filter_parts: list = None  # applies_to_part IDs — use PROD-19 for all PSE tickets
+    new_ticket_filter_part_names: list = None  # legacy: resolved to IDs via parts.list (leave empty)
+    new_ticket_filter_pse_pods: list = None  # post-fetch filter on ctype__pse_pod custom field
     new_ticket_states: list = None
     new_ticket_stage_names: list = None  # e.g. ["triage"] – only tickets in these stages
     new_ticket_unassigned_only: bool = False  # only tickets with no owner
@@ -83,6 +84,8 @@ class MonitorConfig:
             self.new_ticket_filter_parts = []
         if self.new_ticket_filter_part_names is None:
             self.new_ticket_filter_part_names = []
+        if self.new_ticket_filter_pse_pods is None:
+            self.new_ticket_filter_pse_pods = []
         if self.new_ticket_states is None:
             self.new_ticket_states = ["open", "triaged", "backlog"]
         if self.new_ticket_stage_names is None:
@@ -101,6 +104,8 @@ class RetrieverConfig:
     use_embeddings: bool = False
     embedding_provider: str = "openai"
     min_similarity: float = 0.0
+    use_devrev_hybrid: bool = True   # DevRev hybrid search to boost cross-validated matches
+    devrev_hybrid_limit: int = 10    # how many results to fetch from DevRev hybrid search
 
 
 @dataclass
@@ -198,6 +203,8 @@ def _load_retriever(raw: dict) -> "RetrieverConfig":
         use_embeddings=bool(raw.get("use_embeddings", False)),
         embedding_provider=(raw.get("embedding_provider") or "openai").strip(),
         min_similarity=float(raw.get("min_similarity", 0.0)),
+        use_devrev_hybrid=bool(raw.get("use_devrev_hybrid", True)),
+        devrev_hybrid_limit=int(raw.get("devrev_hybrid_limit", 10)),
     )
 
 
@@ -222,6 +229,9 @@ def _load_monitor(raw: dict) -> "MonitorConfig":
     if isinstance(stage_names, str):
         stage_names = [s.strip() for s in stage_names.split(",") if s.strip()]
     unassigned_only = filters.get("unassigned_only", False)
+    pse_pods = filters.get("pse_pod_names") or []
+    if isinstance(pse_pods, str):
+        pse_pods = [s.strip() for s in pse_pods.split(",") if s.strip()]
     interval_hours = raw.get("solved_fetch_interval_hours")
     if interval_hours is None and os.environ.get("DEVREV_SOLVED_FETCH_INTERVAL_HOURS"):
         try:
@@ -237,6 +247,7 @@ def _load_monitor(raw: dict) -> "MonitorConfig":
         interval_minutes=int(raw.get("interval_minutes", 20)),
         new_ticket_filter_parts=parts,
         new_ticket_filter_part_names=part_names,
+        new_ticket_filter_pse_pods=pse_pods,
         new_ticket_states=filters.get("state", ["open", "triaged", "backlog"]),
         new_ticket_stage_names=stage_names,
         new_ticket_unassigned_only=unassigned_only,

@@ -1,13 +1,14 @@
 #!/bin/bash
 #
-# Run bot + auto-watcher together
+# Run bot only (auto-watcher disabled — Claude scheduled task handles analysis)
 #
-# This script starts both the Slack bot and the auto-watcher
-# in the background so you only need one command.
+# Analysis of claude_requests/ is now handled by the Claude scheduled task
+# (runs every 10 min, Mon-Fri 10am-6pm). auto_watcher.py is intentionally
+# NOT started here to avoid race conditions with the Claude analysis.
 #
 # Usage:
-#   ./run_bot.sh          # Start both in foreground
-#   ./run_bot.sh daemon   # Start both in background
+#   ./run_bot.sh          # Start bot in foreground
+#   ./run_bot.sh daemon   # Start bot in background
 
 set -e
 
@@ -16,52 +17,56 @@ cd "$(dirname "$0")"
 # Create logs directory
 mkdir -p logs
 
-# Activate virtual environment
+# Activate virtual environment and resolve python binary
 if [ -d ".venv" ]; then
     source .venv/bin/activate
+    PYTHON=".venv/bin/python3"
+    # Install package if not already installed
+    if ! .venv/bin/python3 -c "import manideep_bot" 2>/dev/null; then
+        echo "📦 Installing manideep_bot package..."
+        .venv/bin/python3 -m pip install -e . -q
+    fi
 elif [ -d "venv" ]; then
     source venv/bin/activate
+    PYTHON="venv/bin/python3"
+    if ! venv/bin/python3 -c "import manideep_bot" 2>/dev/null; then
+        echo "📦 Installing manideep_bot package..."
+        venv/bin/python3 -m pip install -e . -q
+    fi
+else
+    PYTHON=$(command -v python3 || command -v python || echo "python3")
 fi
 
 if [ "$1" = "daemon" ]; then
-    echo "🚀 Starting bot + auto-watcher in background..."
+    echo "🚀 Starting bot in background..."
 
     # Start bot
-    nohup python -m manideep_bot.app > logs/bot.log 2>&1 &
+    nohup $PYTHON -m manideep_bot.app > logs/bot.log 2>&1 &
     BOT_PID=$!
     echo $BOT_PID > logs/bot.pid
     echo "✅ Bot started (PID: $BOT_PID)"
-
-    # Start auto-watcher
-    nohup python scripts/auto_watcher.py > logs/auto_watcher.log 2>&1 &
-    WATCHER_PID=$!
-    echo $WATCHER_PID > logs/auto_watcher.pid
-    echo "✅ Auto-watcher started (PID: $WATCHER_PID)"
+    echo "ℹ️  Analysis handled by Claude scheduled task (every 10 min, Mon-Fri 10am-6pm)"
 
     echo ""
     echo "📋 View logs:"
-    echo "   Bot:          tail -f logs/bot.log"
-    echo "   Auto-watcher: tail -f logs/auto_watcher.log"
+    echo "   Bot: tail -f logs/bot.log"
     echo ""
-    echo "🛑 Stop both:"
-    echo "   kill \$(cat logs/bot.pid) \$(cat logs/auto_watcher.pid)"
+    echo "🛑 Stop:"
+    echo "   kill \$(cat logs/bot.pid)"
 else
-    echo "🚀 Starting bot + auto-watcher..."
+    echo "🚀 Starting bot..."
+    echo "ℹ️  Analysis handled by Claude scheduled task (every 10 min, Mon-Fri 10am-6pm)"
     echo ""
-    echo "This will run both processes. Press Ctrl+C to stop."
+    echo "Press Ctrl+C to stop."
     echo ""
 
-    # Trap Ctrl+C to kill both processes
-    trap 'kill $BOT_PID $WATCHER_PID 2>/dev/null; wait; echo ""; echo "🛑 Stopped"; exit' INT TERM
+    # Trap Ctrl+C
+    trap 'kill $BOT_PID 2>/dev/null; wait; echo ""; echo "🛑 Stopped"; exit' INT TERM
 
-    # Start bot in background
-    python -m manideep_bot.app 2>&1 | sed 's/^/[BOT] /' &
+    # Start bot
+    $PYTHON -m manideep_bot.app 2>&1 | sed 's/^/[BOT] /' &
     BOT_PID=$!
 
-    # Start auto-watcher in background
-    python scripts/auto_watcher.py 2>&1 | sed 's/^/[WATCHER] /' &
-    WATCHER_PID=$!
-
-    # Wait for both
+    # Wait
     wait
 fi

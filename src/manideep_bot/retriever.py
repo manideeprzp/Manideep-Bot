@@ -374,6 +374,48 @@ def find_relevant(
             "score": round(score, 2),
         }))
 
+    # ── DevRev hybrid search boost ─────────────────────────────────────────────
+    # Call DevRev's hybrid search (semantic + keyword) on the same query.
+    # Any ticket that appears in BOTH local BM25 results AND DevRev hybrid results
+    # is cross-validated → boost its score significantly.
+    # Tickets only in hybrid search (not in my solved) are added with lower weight.
+    use_devrev_hybrid = getattr(rcfg, "use_devrev_hybrid", True) if rcfg else True
+    hybrid_limit = getattr(rcfg, "devrev_hybrid_limit", 10) if rcfg else 10
+
+    if use_devrev_hybrid:
+        try:
+            from . import devrev_client
+            hybrid_results = devrev_client.find_similar_issues(
+                query[:500], limit=hybrid_limit, only_solved=True
+            )
+            # Build a set of display_ids returned by hybrid search, with rank-based scores
+            # Rank 1 = highest score (10), rank N = lowest (10 - rank + 1, min 1)
+            hybrid_score_map: dict[str, float] = {}
+            for rank, work in enumerate(hybrid_results, 1):
+                did = (work.get("display_id") or "").strip()
+                if did:
+                    hybrid_score_map[did] = max(1.0, 10.0 - rank + 1)
+
+            if hybrid_score_map:
+                # Build a map of display_id → index in scored list
+                scored_id_map = {
+                    item.get("display_id", ""): idx
+                    for idx, (_, item) in enumerate(scored)
+                }
+                for did, h_score in hybrid_score_map.items():
+                    if did in scored_id_map:
+                        # Cross-validated: in both local solved + DevRev hybrid → big boost
+                        idx = scored_id_map[did]
+                        old_score, item = scored[idx]
+                        new_score = old_score + h_score * 2.0  # 2x boost for cross-validation
+                        scored[idx] = (new_score, {**item, "hybrid_match": True})
+                    else:
+                        # In hybrid search but not in local solved tickets — skip
+                        # (we only surface tickets Manideep personally solved)
+                        pass
+        except Exception:
+            pass  # hybrid search unavailable — fall through to BM25 results only
+
     scored.sort(key=lambda x: -x[0])
     return [item for _, item in scored[:k]]
 
@@ -388,7 +430,8 @@ def format_relevant_for_prompt(relevant: list[dict], max_items: int = 10) -> str
         title = (t.get("title") or "")[:120]
         tags = ", ".join(t.get("tag_names") or [])[:80]
         snippet = (t.get("body_snippet") or "")[:300]
-        lines.append(f"{i}. [{tid}] {title}")
+        hybrid = " ✓ hybrid-validated" if t.get("hybrid_match") else ""
+        lines.append(f"{i}. [{tid}] {title}{hybrid}")
         if tags:
             lines.append(f"   Tags: {tags}")
         if snippet:

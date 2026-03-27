@@ -167,6 +167,17 @@ def _fetch_new_tickets(config):
     # Filter to unassigned only (no owner)
     if unassigned_only:
         out = [w for w in out if not (w.get("owned_by") or [])]
+    # Filter by PSE pod (ctype__pse_pod custom field) — case-insensitive
+    pse_pods = getattr(config.monitor, "new_ticket_filter_pse_pods", None) or []
+    if pse_pods:
+        pod_set = {p.strip().lower() for p in pse_pods if p}
+        out = [
+            w for w in out
+            if (
+                (w.get("custom_fields") or {}).get("ctype__pse_pod") or
+                w.get("ctype__pse_pod") or ""
+            ).strip().lower() in pod_set
+        ]
     return out
 
 

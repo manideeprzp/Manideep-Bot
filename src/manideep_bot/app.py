@@ -28,6 +28,53 @@ logger = logging.getLogger(__name__)
 # Per-thread state: (channel_id, thread_ts) -> dict
 _thread_state = {}
 
+# Persist thread state to disk so restarts don't lose it
+import json as _json
+from pathlib import Path as _Path
+_STATE_FILE = _Path(__file__).resolve().parents[2] / "data" / "thread_state.json"
+
+
+def _load_persisted_state():
+    """Load thread state from disk on startup."""
+    try:
+        if _STATE_FILE.exists():
+            raw = _json.loads(_STATE_FILE.read_text())
+            # Keys are stored as "channel::thread_ts" strings, convert back to tuples
+            return {tuple(k.split("::", 1)): v for k, v in raw.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_persisted_state():
+    """Save current thread state to disk."""
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        serializable = {"::".join(k): v for k, v in _thread_state.items()}
+        _STATE_FILE.write_text(_json.dumps(serializable, indent=2))
+    except Exception as e:
+        logger.warning("Could not save thread state: %s", e)
+
+
+# Load persisted state on startup
+_thread_state.update(_load_persisted_state())
+
+
+def set_thread_state_from_analysis(channel: str, thread_ts: str, ticket_id: str, content: str, ticket_text: str = ""):
+    """Called by response_watcher after posting an analysis, so 'yes' replies work correctly."""
+    skill = _parse_skill_name(content) or "none"
+    key = (channel, thread_ts)
+    _thread_state[key] = {
+        "step": "suggested",
+        "skill_name": skill,
+        "display_id": ticket_id,
+        "ticket_text": ticket_text,
+        "channel": channel,
+        "thread_ts": thread_ts,
+    }
+    _save_persisted_state()
+    logger.info("Thread state set for %s: skill=%s", ticket_id, skill)
+
 # Skills safe to auto-run when ticket arrives (no "Yes" needed).
 # These are read-only or reversible — output is reviewed before closing.
 # Destructive skills (gc-cancellation, rmp-gandalf) are NOT here → always manual.
@@ -36,6 +83,7 @@ _AUTO_RUN_SKILLS = {
     "order-trace-debugger",
     "vishnu-terraform-kong-pr",
     "invalid-rewards-debugger",
+    "github-pr",  # Read-only: fetch PR details / list PRs
 }
 
 # ── DevRev PSE dropdown enums (from ctype__custom_type_fragment/17305) ───────
@@ -113,6 +161,8 @@ def _thread_key(event):
 
 def _normalize_approve(text):
     t = (text or "").strip().lower()
+    # Strip Slack MCP footer: "yes *Sent using* <@U...>" → "yes"
+    t = re.sub(r"\s*\*sent using\*.*$", "", t).strip()
     if t in ("yes", "proceed", "y", "go", "run it", "done"):
         return "yes"
     if t in ("approve", "approved", "close it", "post and close"):
@@ -192,13 +242,30 @@ def _parse_work_id(text):
 def _parse_skill_name(text):
     if not text:
         return None
-    m = re.search(r"\*\*skill\s+to\s+run:\*\*\s*([a-z0-9-]+)", text, re.I)
+    # Pattern 1: **Skill to run:** `gc-redemption-report` (response file format)
+    m = re.search(r"\*\*skill\s+to\s+run:\*\*\s*`*([a-z0-9-]+)`*", text, re.I)
     if m:
-        return m.group(1).strip()
-    m = re.search(r"skill[:\s]+([a-z0-9-]+)", text, re.I)
+        val = m.group(1).strip().strip("`")
+        return val if val and val != "none" else None
+    # Pattern 2: *Skill:*  `order-trace-debugger` (Slack attachment format from _build_attachments)
+    m = re.search(r"\*skill:\*\s*`+([a-z0-9-]+)`+", text, re.I)
     if m:
-        return m.group(1).strip()
+        val = m.group(1).strip().strip("`")
+        return val if val and val != "none" else None
+    # Pattern 3: Skill: `order-trace-debugger` or Skill: order-trace-debugger (plain text)
+    m = re.search(r"^skill:\s*`*([a-z0-9-]+)`*$", text, re.I | re.M)
+    if m:
+        val = m.group(1).strip().strip("`")
+        return val if val and val != "none" else None
     return None
+
+
+_KNOWN_SKILLS = {
+    "gc-redemption-report", "gc-cancellation", "cancel-gc",
+    "order-trace-debugger", "vishnu-terraform-kong-pr", "vishnu-kong-pr",
+    "kong-pr", "dns-pr", "github-pr", "voucher-benefit-upload",
+    "invalid-rewards-debugger", "rmp-gandalf",
+}
 
 
 def _parse_close_command(text: str):
@@ -305,6 +372,9 @@ def _handle_close_request(display_id: str, event: dict, say, config, thread_key:
     )
     say(text=prompt, thread_ts=thread_ts)
 
+    # Carry over skill_name from existing thread state (e.g. if user ran a skill
+    # in this thread and then issued "close ISS-XXXXX" to complete the flow).
+    prior_skill = (_thread_state.get(thread_key) or {}).get("skill_name", "")
     _thread_state[thread_key] = {
         "step": "awaiting_close_info",
         "work_id": work_id,
@@ -312,6 +382,7 @@ def _handle_close_request(display_id: str, event: dict, say, config, thread_key:
         "title": title,
         "current_cause": current_cause,
         "current_breach": current_breach,
+        "skill_name": prior_skill,  # auto-tag with skill on close if known
     }
 
 
@@ -378,33 +449,56 @@ def run_slack_bot():
         say(text=":hourglass_flowing_sand: Analysing...", thread_ts=thread_ts)
         try:
             channel = event.get("channel")
-            ticket_id = _parse_work_id(text)
-            result = _get_analysis(text, config, ticket_id, channel, thread_ts)
-
-            if isinstance(result, tuple):
-                response, returned_ticket_id = result
-                if returned_ticket_id:
-                    save_thread_mapping(returned_ticket_id, channel, thread_ts)
-                say(text=response, thread_ts=thread_ts)
-            else:
-                response = result
-                from .response_watcher import _post_formatted
-                _post_formatted(app.client, channel, thread_ts, ticket_id or "ticket", response)
-
-            key = _thread_key(event)
             display_id = _parse_work_id(text)
             from . import devrev_client
             from .enhanced_agent import detect_skill as _detect_skill
-            work_id = devrev_client.display_id_to_work_id(display_id) if display_id else None
-            _detected, _conf = _detect_skill(text)
-            _skill = _detected or _parse_skill_name(response) or "none"
+
+            # Step 1: Fetch full ticket from DevRev
+            ticket_text = text
+            work_id = None
+            work = None
+            if display_id:
+                work_id = devrev_client.display_id_to_work_id(display_id)
+                try:
+                    work = devrev_client.get_work_by_display_id(display_id)
+                    if work:
+                        _title = (work.get("title") or "")
+                        _body = (work.get("body") or "")[:3000]
+                        ticket_text = f"{_title}\n\n{_body}".strip() or text
+                except Exception as e:
+                    logger.warning("Could not fetch ticket body for %s: %s", display_id, e)
+
+            # Step 2: Detect skill directly — no file queue, no waiting
+            _skill, _conf = _detect_skill(ticket_text)
+
+            # Step 3: If Anthropic key set, use LLM for richer analysis
+            has_api_key = bool(getattr(config.anthropic, "api_key", None))
+            if has_api_key:
+                response = enhanced_reply(ticket_text, config)
+                _skill = _skill or _parse_skill_name(response) or "none"
+                from .response_watcher import _post_formatted
+                _post_formatted(app.client, channel, thread_ts, display_id or "ticket", response)
+            else:
+                # No Anthropic key — queue for Claude scheduled task (every 10 min, Mon-Fri 10am-6pm)
+                from .claude_code_agent import claude_code_reply
+                from .response_watcher import save_thread_mapping
+                req_ticket_id = display_id or f"ticket_{int(time.time())}"
+                if display_id:
+                    save_thread_mapping(display_id, channel, thread_ts)
+                claude_code_reply(ticket_text, config, ticket_id=req_ticket_id)
+                say(text="⏳ Queued for Claude analysis — response will appear in this thread within 10 minutes.", thread_ts=thread_ts)
+
+            _skill = _skill or "none"
+            key = _thread_key(event)
             _thread_state[key] = {
                 "step": "suggested",
-                "ticket_text": text,
+                "ticket_text": ticket_text,
                 "work_id": work_id,
                 "display_id": display_id,
                 "skill_name": _skill,
             }
+            _save_persisted_state()
+            logger.info("handle_mention: %s → skill=%s conf=%s", display_id, _skill, _conf)
         except Exception as e:
             logger.exception("Agent error")
             say(text=f"Error: {e}", thread_ts=thread_ts)
@@ -417,13 +511,63 @@ def run_slack_bot():
             return
         ch = event.get("channel", "")
         key = (ch, thread_ts)
+        user_text = (event.get("text") or "").strip()
+        logger.info("[MSG] ch=%s thread=%s text=%r", ch, thread_ts, user_text[:80])
         state = _thread_state.get(key)
         from . import bucket as bucket_mod
         if not state:
             state = bucket_mod.get_thread_state_from_bucket(ch, thread_ts)
             is_bucket = bool(state)
+            if state:
+                logger.info("[MSG] State from bucket: step=%s skill=%s", state.get("step"), state.get("skill_name"))
+            else:
+                logger.info("[MSG] No state found (in-memory or bucket)")
         else:
             is_bucket = False
+            logger.info("[MSG] State from memory: step=%s skill=%s", state.get("step"), state.get("skill_name"))
+
+        # If no state but user said "yes" — recover from Slack thread history
+        text_raw = (event.get("text") or "").strip()
+        cmd_raw = _normalize_approve(text_raw)
+        if not state and cmd_raw == "yes":
+            try:
+                history = client.conversations_replies(channel=ch, ts=thread_ts, limit=20)
+                messages = history.get("messages", [])
+                recovered_skill, recovered_display_id, recovered_ticket_text = None, None, ""
+                for msg in messages:
+                    msg_text = msg.get("text", "")
+                    # Also search attachment texts — bot posts skill name inside attachments
+                    for att in msg.get("attachments", []):
+                        att_text = att.get("text", "")
+                        if att_text:
+                            msg_text += "\n" + att_text
+                    # Look for bot analysis messages with skill info
+                    _s = _parse_skill_name(msg_text)
+                    if _s and _s != "none":
+                        recovered_skill = _s
+                    # Look for ticket ID in any message
+                    _d = _parse_work_id(msg_text)
+                    if _d:
+                        recovered_display_id = _d
+                    # Use bot analysis text as ticket context
+                    if msg.get("bot_id") and "Analysis:" in msg.get("text", ""):
+                        recovered_ticket_text = msg_text[:3000]
+                if recovered_skill:
+                    state = {
+                        "step": "suggested",
+                        "skill_name": recovered_skill,
+                        "display_id": recovered_display_id or "",
+                        "ticket_text": recovered_ticket_text,
+                        "channel": ch,
+                        "thread_ts": thread_ts,
+                    }
+                    _thread_state[key] = state
+                    _save_persisted_state()
+                    is_bucket = False
+                    logger.info("Recovered state from thread history: skill=%s display_id=%s", recovered_skill, recovered_display_id)
+            except Exception as _re:
+                logger.warning("Could not recover state from thread history: %s", _re)
+
         if not state:
             return
 
@@ -455,13 +599,17 @@ def run_slack_bot():
             cause_code = _pick_from_list(cause_raw, _CAUSE_CODES) if cause_raw else state.get("current_cause", "")
             breach_reason = _pick_from_list(breach_raw, _BREACH_REASONS) if breach_raw else state.get("current_breach", "")
 
-            # Build tag list
+            # Build tag list — include skill tag if a skill was used in this thread
             from . import devrev_client as dc
             extra_tags = []
             if tags_raw:
                 for t in [x.strip() for x in re.split(r"[,;]", tags_raw) if x.strip()]:
                     extra_tags.append({"name": t, "value": ""})
-            tags_to_add = dc.build_tags_for_closure(extra_tags=extra_tags)
+            skill_name_for_tag = (state.get("skill_name") or "").strip()
+            tags_to_add = dc.build_tags_for_closure(
+                skill_name=skill_name_for_tag,
+                extra_tags=extra_tags,
+            )
 
             # Custom fields — ctype__ fields go into the custom_fields nested dict via works.update
             custom_fields = {}
@@ -511,13 +659,95 @@ def run_slack_bot():
                 _thread_state.pop(key, None)
             return
 
+        # ── Handle missing-info reply: user provides card number / URL / order_id
+        # When step=suggested and the reply is NOT yes/no/approve, treat it as
+        # extra context, append to ticket_text, and auto-re-run the skill.
+        if (state.get("step") == "suggested"
+                and cmd not in ("yes", "no", "approve", "confirm", "done")
+                and state.get("awaiting_info")):
+            from . import skill_runner
+            ticket_text = (state.get("ticket_text") or "") + "\n" + text
+            state["ticket_text"] = ticket_text
+            state.pop("awaiting_info", None)
+            skill_name = state.get("skill_name", "none")
+            # If user typed a skill name directly (e.g. "gc-redemption-report"), use it
+            _cmd_clean = cmd.strip().strip("`").lower()
+            if _cmd_clean in _KNOWN_SKILLS:
+                skill_name = _cmd_clean
+                state["skill_name"] = skill_name
+            # If skill still none, try parsing from the text itself
+            if not skill_name or skill_name == "none":
+                _parsed = _parse_skill_name(text)
+                if _parsed:
+                    skill_name = _parsed
+                    state["skill_name"] = skill_name
+            say(text=":hourglass_flowing_sand: Got it — re-running skill...", thread_ts=thread_ts)
+            out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=state.get("display_id", ""))
+            if not ok:
+                state["awaiting_info"] = True
+                if is_bucket:
+                    bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+                else:
+                    _thread_state[key] = state
+                say(text=f":warning: {out}", thread_ts=thread_ts)
+                return
+            say(
+                text=f"Work done. Output:\n```\n{out[:2500]}\n```\n\nReply *Approve* to post this on the ticket and close it.",
+                thread_ts=thread_ts,
+            )
+            state["step"] = "pending_approve"
+            state["output"] = out
+            state["summary"] = out[:500]
+            if is_bucket:
+                bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+            else:
+                _thread_state[key] = state
+            return
+
+        logger.info("[MSG] cmd=%r step=%r is_bucket=%s", cmd, state.get("step"), is_bucket)
         if cmd == "yes" and state.get("step") == "suggested":
+            logger.info("[MSG] >>> Running skill for 'yes': skill=%s", state.get("skill_name"))
             from . import skill_runner
             ticket_text = state.get("ticket_text") or ""
-            skill_name = state.get("skill_name") or "order-trace-debugger"
-            out, ok = skill_runner.run_skill(skill_name, ticket_text)
+            skill_name = (state.get("skill_name") or "").strip()
+
+            # Recover skill from response file if still "none"
+            if not skill_name or skill_name == "none":
+                display_id = state.get("display_id") or ""
+                if display_id:
+                    import pathlib
+                    _data_root = pathlib.Path(__file__).resolve().parents[3] / "data"
+                    # Check both active and done folders (scheduled task archives to done/)
+                    for _resp_file in [
+                        _data_root / "claude_responses" / f"{display_id}.md",
+                        _data_root / "claude_responses" / "done" / f"{display_id}.md",
+                    ]:
+                        if _resp_file.exists():
+                            _resp_content = _resp_file.read_text()
+                            _recovered = _parse_skill_name(_resp_content)
+                            if _recovered and _recovered != "none":
+                                skill_name = _recovered
+                                state["skill_name"] = skill_name
+                                # Also enrich ticket_text from the response if current is bare mention
+                                if len(ticket_text) < 50:
+                                    ticket_text = _resp_content[:3000]
+                                    state["ticket_text"] = ticket_text
+                                break
+                # Final fallback: re-detect from ticket_text
+                if not skill_name or skill_name == "none":
+                    from .enhanced_agent import detect_skill as _detect_skill
+                    _sk, _ = _detect_skill(ticket_text)
+                    skill_name = _sk or "none"
+
+            out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=state.get("display_id", ""))
             if not ok:
-                say(text=f"Could not run skill: {out}\nReply **Done** again after adding missing info (e.g. order_id).", thread_ts=thread_ts)
+                # Mark that we're waiting for missing info — next reply auto-reruns
+                state["awaiting_info"] = True
+                if is_bucket:
+                    bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+                else:
+                    _thread_state[key] = state
+                say(text=f":warning: {out}", thread_ts=thread_ts)
                 return
             say(
                 text=f"Work done. Output:\n```\n{out[:2500]}\n```\n\nReview. If correct, reply **Approve** to post this on the ticket and close it.",
@@ -554,10 +784,8 @@ def run_slack_bot():
                 return
             try:
                 from . import devrev_client
-                from .monitor import append_solved_ticket_after_approve
                 from .claude_code_agent import load_similar_data
 
-                summary = state.get("summary") or state.get("output") or "Resolved by Manideep Bot."
                 skill_name = (state.get("skill_name") or "").strip()
                 display_id = state.get("display_id") or ""
 
@@ -568,20 +796,80 @@ def run_slack_bot():
                 similar_tickets = similar_data.get("similar_tickets") or []
                 best_similar_id = similar_tickets[0].get("display_id", "") if similar_tickets else ""
 
-                # 1. Build structured resolution comment
+                # Build proposed tags — show to user for validation before closing
+                tags_to_add = devrev_client.build_tags_for_closure(
+                    skill_name=skill_name,
+                    similar_ticket_tags=similar_tags,
+                )
+                tag_names = [t["name"] for t in tags_to_add]
+                tag_preview = ", ".join(f"`{n}`" for n in tag_names) if tag_names else "_none_"
+
+                preview_msg = (
+                    f":label: *Tag preview for {display_id or work_id}:*\n"
+                    f"{tag_preview}\n\n"
+                    f"Reply *confirm* to close with these tags.\n"
+                    f"Or override: `tags: tag1, tag2` (replaces the list above)."
+                )
+                say(text=preview_msg, thread_ts=thread_ts)
+
+                # Stash everything needed for the actual close
+                state["step"] = "pending_tag_confirm"
+                state["tags_to_add"] = tags_to_add
+                state["similar_fields"] = similar_fields
+                state["best_similar_id"] = best_similar_id
+                if is_bucket:
+                    bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+                else:
+                    _thread_state[key] = state
+            except Exception as e:
+                logger.exception("DevRev tag preview: %s", e)
+                say(text=f"Failed to build tag preview: {e}", thread_ts=thread_ts)
+            return
+
+        # ── Tag-confirmation step: user validates tags before close ──────────
+        if state.get("step") == "pending_tag_confirm":
+            work_id = state.get("work_id")
+            display_id = state.get("display_id") or ""
+            raw_text = text.strip().lower()
+
+            # Allow override: "tags: tag1, tag2"
+            tags_override_raw = _extract_field(text, r"^tags?[\s:：]+(.+)$", r"tags?[\s:：]+(.+)")
+            if tags_override_raw:
+                from . import devrev_client as dc
+                override_list = [{"name": t.strip(), "value": ""} for t in re.split(r"[,;]", tags_override_raw) if t.strip()]
+                state["tags_to_add"] = dc.build_tags_for_closure(extra_tags=override_list)
+                tag_names = [t["name"] for t in state["tags_to_add"]]
+                say(text=f":white_check_mark: Tags updated: {', '.join(f'`{n}`' for n in tag_names)}. Reply *confirm* to close.", thread_ts=thread_ts)
+                if is_bucket:
+                    bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+                else:
+                    _thread_state[key] = state
+                return
+
+            if raw_text not in ("confirm", "yes", "ok", "done", "close it", "proceed"):
+                say(
+                    text="Reply *confirm* to close with those tags, or override with `tags: tag1, tag2`.",
+                    thread_ts=thread_ts,
+                )
+                return
+
+            # User confirmed — execute the close
+            try:
+                from . import devrev_client
+                from .monitor import append_solved_ticket_after_approve
+
+                summary = state.get("summary") or state.get("output") or "Resolved by Manideep Bot."
+                skill_name = (state.get("skill_name") or "").strip()
+                tags_to_add = state.get("tags_to_add") or []
+                similar_fields = state.get("similar_fields") or {}
+                best_similar_id = state.get("best_similar_id") or ""
+
                 resolution_comment = devrev_client.build_resolution_comment(
                     summary=summary,
                     skill_name=skill_name,
                     similar_ticket_id=best_similar_id,
                 )
 
-                # 2. Build tags: similar ticket tags + skill tag + bot_resolved
-                tags_to_add = devrev_client.build_tags_for_closure(
-                    skill_name=skill_name,
-                    similar_ticket_tags=similar_tags,
-                )
-
-                # 3. Comprehensive update: comment + tags + stage + custom fields
                 devrev_client.work_update_full(
                     work_id=work_id,
                     stage_name=config.devrev.closed_stage_name,
@@ -592,10 +880,9 @@ def run_slack_bot():
 
                 append_solved_ticket_after_approve(config, work_id)
 
-                # Build Slack confirmation with details
                 tag_names = [t["name"] for t in tags_to_add]
                 confirm_parts = [
-                    f"Posted resolution on ticket and set stage to *{config.devrev.closed_stage_name}*.",
+                    f":white_check_mark: *{display_id}* closed — stage set to `{config.devrev.closed_stage_name}`.",
                     f"Tags added: {', '.join(f'`{t}`' for t in tag_names)}" if tag_names else "",
                     f"Similar ticket referenced: `{best_similar_id}`" if best_similar_id else "",
                     "Done.",
@@ -609,6 +896,10 @@ def run_slack_bot():
             else:
                 _thread_state.pop(key, None)
             return
+
+        # If we reach here, no handler matched
+        logger.info("[MSG] No handler matched: cmd=%r step=%r awaiting_info=%s",
+                     cmd, state.get("step"), state.get("awaiting_info"))
 
     # ── New-issue notification handler ───────────────────────────────────────
 
@@ -736,7 +1027,7 @@ def run_slack_bot():
                     text=f":robot_face: *Auto-running* `{skill_name}` — no approval needed for this skill...",
                 )
                 from . import skill_runner
-                out, ok = skill_runner.run_skill(skill_name, ticket_text)
+                out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=display_id)
                 if ok:
                     client.chat_postMessage(
                         channel=bucket_ch,
@@ -806,6 +1097,127 @@ def run_slack_bot():
         if event.get("bot_id"):
             return
         handle_message(event, say, client)
+
+    # ── Catch-up scan on startup ─────────────────────────────────────────────
+    def _catchup_scan():
+        """
+        Runs once on startup (in background thread, after 8s delay for connection).
+        Fetches unassigned PSE tickets in triage stage from the last 24 hours
+        that the bot may have missed while it was down, and processes each one.
+        """
+        import time as _time
+        _time.sleep(8)  # wait for Slack connection to stabilise
+
+        if not bucket_ch:
+            logger.warning("Catch-up scan: bucket_channel_id not set, skipping")
+            return
+
+        logger.info("🔍 Catch-up scan: checking for missed unassigned tickets...")
+        try:
+            from . import devrev_client
+            from .monitor import _fetch_new_tickets
+            from .response_watcher import _post_formatted
+            from . import bucket as bucket_mod
+            from .enhanced_agent import detect_skill as _detect_skill
+
+            tickets = _fetch_new_tickets(config)
+            if not tickets:
+                logger.info("Catch-up scan: no unassigned tickets found")
+                app.client.chat_postMessage(
+                    channel=bucket_ch,
+                    text="✅ *Catch-up scan complete* — no missed unassigned tickets found.",
+                )
+                return
+
+            logger.info("Catch-up scan: found %d unassigned ticket(s) to process", len(tickets))
+            app.client.chat_postMessage(
+                channel=bucket_ch,
+                text=f"🔍 *Catch-up scan* — found *{len(tickets)}* unassigned ticket(s) missed while bot was down. Processing now...",
+            )
+
+            for w in tickets[:15]:  # cap at 15 to avoid spam
+                work_id = w.get("id", "")
+                display_id = w.get("display_id") or work_id
+                title = (w.get("title") or "")[:200]
+                body = (w.get("body") or "")[:3000]
+                ticket_text = f"{title}\n\n{body}".strip() or str(display_id)
+
+                try:
+                    # Auto-assign if unassigned
+                    assigned_now = False
+                    if my_user_id and _is_unassigned(w, svcacc_id):
+                        try:
+                            current_count = devrev_client.count_open_tickets_for_user(my_user_id)
+                            if current_count < 15:
+                                devrev_client.work_assign(work_id, my_user_id)
+                                assigned_now = True
+                                logger.info("Catch-up: auto-assigned %s", display_id)
+                        except Exception as e:
+                            logger.warning("Catch-up auto-assign failed for %s: %s", display_id, e)
+
+                    # Post ticket notification
+                    app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
+                    ticket_url = f"{app_base}/razorpay/issue/{display_id}"
+                    status_line = "✅ Auto-assigned to you (catch-up)" if assigned_now else "_(already assigned)_"
+
+                    notify_result = app.client.chat_postMessage(
+                        channel=bucket_ch,
+                        text=f"[Catch-up] {display_id} — {title[:80]}",
+                        attachments=[{
+                            "color": "#FF8C00",  # orange = catch-up (vs blue = live)
+                            "title": f"[Catch-up] {display_id} — {title[:80]}",
+                            "title_link": ticket_url,
+                            "text": status_line,
+                            "footer": "DevRev · PSE · Missed while bot was down",
+                        }],
+                    )
+                    posted_ts = notify_result["ts"]
+
+                    # Detect skill + post analysis
+                    skill_name, confidence = _detect_skill(ticket_text)
+                    skill_name = skill_name or "none"
+
+                    from .scripts_utils import build_inline_analysis
+                    response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
+                    _post_formatted(app.client, bucket_ch, posted_ts, display_id, response)
+
+                    # Auto-run safe skills
+                    if skill_name in _AUTO_RUN_SKILLS:
+                        app.client.chat_postMessage(
+                            channel=bucket_ch,
+                            thread_ts=posted_ts,
+                            text=f":robot_face: *Auto-running* `{skill_name}`...",
+                        )
+                        from . import skill_runner
+                        out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=display_id)
+                        result_text = (
+                            f":white_check_mark: `{skill_name}` done.\n```\n{out[:2500]}\n```\n\nReply *Approve* to post and close."
+                            if ok else
+                            f":warning: Auto-run failed: {out}\n\nReply *Yes* after adding missing info."
+                        )
+                        app.client.chat_postMessage(channel=bucket_ch, thread_ts=posted_ts, text=result_text)
+                        step = "pending_approve" if ok else "suggested"
+                    else:
+                        step = "suggested"
+
+                    bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                        "step": step,
+                        "work_id": work_id,
+                        "display_id": display_id,
+                        "ticket_text": ticket_text,
+                        "skill_name": skill_name,
+                    })
+
+                except Exception as e:
+                    logger.exception("Catch-up: error processing %s: %s", display_id, e)
+
+            logger.info("Catch-up scan complete — processed %d ticket(s)", len(tickets))
+
+        except Exception as e:
+            logger.exception("Catch-up scan failed: %s", e)
+
+    import threading as _threading
+    _threading.Thread(target=_catchup_scan, daemon=True, name="catchup-scan").start()
 
     handler = SocketModeHandler(app, config.slack.app_token)
     logger.info(

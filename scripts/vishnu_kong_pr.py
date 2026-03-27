@@ -196,14 +196,39 @@ def commit_and_push(repo: Path, branch: str, message: str):
 
 
 def create_pr(repo: Path, title: str, body: str) -> str:
-    """Create GitHub PR and return the PR URL."""
-    result = run(
-        f'gh pr create --title "{title}" --body "{body}" --head $(git branch --show-current)',
-        repo,
-    )
-    url = result.stdout.strip()
-    print(f"  PR created: {url}")
-    return url
+    """Create GitHub PR and return the PR URL. Handles 'already exists' gracefully."""
+    import tempfile, os
+    # Write body to a temp file — avoids all shell quoting/backtick issues
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(body)
+        body_file = f.name
+    try:
+        branch = subprocess.run(
+            "git branch --show-current", shell=True, cwd=str(repo),
+            capture_output=True, text=True
+        ).stdout.strip()
+        result = subprocess.run(
+            ["gh", "pr", "create",
+             "--title", title,
+             "--body-file", body_file,
+             "--head", branch],
+            cwd=str(repo), capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            print(f"  PR created: {url}")
+            return url
+        # PR already exists — extract URL from stderr
+        existing = re.search(r"https://github\.com/\S+/pull/\d+", result.stderr or result.stdout)
+        if existing:
+            url = existing.group(0)
+            print(f"  PR already exists: {url}")
+            return url
+        raise RuntimeError(
+            f"gh pr create failed:\n  stdout: {result.stdout.strip()}\n  stderr: {result.stderr.strip()}"
+        )
+    finally:
+        os.unlink(body_file)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

@@ -137,8 +137,14 @@ def _build_summary(skill_name: str, text: str, ticket_id: str) -> str:
     """Generate a 1-2 sentence analysis summary."""
     text_lower = text.lower()
     if skill_name == "gc-redemption-report":
-        card_m = re.search(r"\b(GC[A-Z0-9]{6,}|[A-Z]{2}[0-9]{9,})\b", text)
-        card = card_m.group(0) if card_m else "provided card"
+        # Match: "card number: 7717386747", "GC123456789", "RZ97262589925171", or bare 10+ digit number
+        card_m = (
+            re.search(r"card[_\s-]?number[\s:=]+([A-Za-z0-9]+)", text, re.I)
+            or re.search(r"\b(GC[A-Z0-9]{6,})\b", text, re.I)
+            or re.search(r"\b([A-Z]{2}[0-9]{9,})\b", text, re.I)
+            or re.search(r"\b([0-9]{10,})\b", text)
+        )
+        card = card_m.group(1) if card_m else "provided card"
         return f"Customer has a gift card issue for {card}. Running redemption report to check balance and transaction history."
     if skill_name == "gc-cancellation":
         return "Gift card cancellation requested. Will verify card status and proceed with cancellation after confirming reason."

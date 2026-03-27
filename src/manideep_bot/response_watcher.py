@@ -124,9 +124,10 @@ def _post_formatted(slack_client, channel: str, thread_ts: str, ticket_id: str, 
     """Post analysis as Slack attachments with color bars for clean rendering."""
     try:
         attachments = _build_attachments(content, ticket_id)
+        skill = _extract_section(content, "Skill to run") or "none"
         slack_client.chat_postMessage(
             channel=channel,
-            text=f":mag: *Analysis: {ticket_id}*",
+            text=f":mag: *Analysis: {ticket_id}* | Skill to run: `{skill}`",
             attachments=attachments,
             thread_ts=thread_ts,
         )
@@ -171,6 +172,15 @@ def start_response_watcher(slack_client):
                         try:
                             _post_formatted(slack_client, channel, thread_ts, ticket_id, content)
                             logger.info("Posted analysis for %s to %s", ticket_id, channel)
+                            # Set thread state so "yes" replies work correctly
+                            try:
+                                from . import app as _app
+                                # Load ticket_text from the request file if available
+                                _req_file = Path(__file__).resolve().parent.parent.parent / "data" / "claude_requests" / "done" / f"{ticket_id}.md"
+                                _ticket_text = _req_file.read_text() if _req_file.exists() else ""
+                                _app.set_thread_state_from_analysis(channel, thread_ts, ticket_id, content, _ticket_text)
+                            except Exception as _se:
+                                logger.warning("Could not set thread state for %s: %s", ticket_id, _se)
                         except Exception as e:
                             logger.error("Failed to post response for %s: %s", ticket_id, e)
                         mappings.pop(ticket_id, None)

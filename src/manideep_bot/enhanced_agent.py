@@ -19,18 +19,47 @@ logger = logging.getLogger(__name__)
 # Pattern → skill mapping (keyword-based, used when no tag signal is available)
 # Order matters: more specific patterns first to avoid false positives
 ISSUE_PATTERNS = [
-    # DNS / Kong PR — must come before gc patterns (no overlap risk)
-    (re.compile(r"add\s+(dns|domain|route|cname)|vishnu|terraform.?kong|kong.?pr|cors.?origin|subdomain.*razorpay|razorpay\.com.*\bdomain\b", re.I), "vishnu-terraform-kong-pr"),
-    # GC cancellation — before redemption-report (cancel is more specific)
-    (re.compile(r"cancel\s+(gc|gift.?card|card)|gc\s+cancel|deactivate\s+(gc|gift.?card)", re.I), "gc-cancellation"),
-    # GC redemption report
-    (re.compile(r"gc|gift.?card|card.?number|redemption.?report", re.I), "gc-redemption-report"),
+    # DNS / Kong PR — most specific, check first
+    (re.compile(
+        r"add\s+(dns|domain|route|cname|cors)"
+        r"|vishnu|terraform.?kong|kong.?pr|cors.?origin"
+        r"|dns\s+(record|entry|cname)"
+        r"|\b([a-z0-9-]+\.razorpay\.com).*(dns|cors|onboard|domain|add)"
+        r"|(dns|cors|onboard|domain|add).*\b([a-z0-9-]+\.razorpay\.com)",
+        re.I), "vishnu-terraform-kong-pr"),
+
+    # GC cancellation — before redemption (cancel is more specific than gc)
+    (re.compile(
+        r"cancel\s+(gc|gift.?card|card)"
+        r"|gc\s+cancel"
+        r"|deactivate\s+(gc|gift.?card)"
+        r"|block\s+(gc|gift.?card)"
+        r"|fraud.*gift.?card|gift.?card.*fraud",
+        re.I), "gc-cancellation"),
+
+    # GC redemption report — requires more than just "gc" to avoid false positives
+    (re.compile(
+        r"gift.?card.*(balance|transaction|report|redeem|redemption)"
+        r"|(balance|transaction|report|redeem|redemption).*gift.?card"
+        r"|card.?number\s*[:=]\s*\S+"   # ticket has an actual card number
+        r"|redemption.?report"
+        r"|gc.*(balance|recharge|redeem|transaction|report)"
+        r"|(balance|recharge|redeem|transaction|report).*\bgc\b",
+        re.I), "gc-redemption-report"),
+
     # Order trace
-    (re.compile(r"order.?id|order.?fail|reward.?order|order.?not\s+(visible|showing|found)", re.I), "order-trace-debugger"),
+    (re.compile(
+        r"order[_\s-]?id\s*[:=]"        # explicit order_id field
+        r"|order.*(fail|not\s+visible|not\s+showing|missing|stuck|refund)"
+        r"|(fail|missing|stuck|refund).*order"
+        r"|reward.?order|order.?reward",
+        re.I), "order-trace-debugger"),
+
     # Invalid rewards
-    (re.compile(r"invalid.?reward|reward.?invalid", re.I), "invalid-rewards-debugger"),
+    (re.compile(r"invalid.?reward|reward.?invalid|reward.*(not\s+applied|not\s+working)", re.I), "invalid-rewards-debugger"),
+
     # RMP Gandalf
-    (re.compile(r"\brmp\b|gandalf", re.I), "rmp-gandalf"),
+    (re.compile(r"\brmp\b.*gandalf|gandalf.*\brmp\b|\brmp\s+access\b", re.I), "rmp-gandalf"),
 ]
 
 # Tag → skill mapping (from solved issues — highest confidence signal)

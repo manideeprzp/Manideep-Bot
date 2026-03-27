@@ -38,3 +38,12 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Claude Code local settings
+.claude/
+
+# Separate repos (agent-skills has its own git)
+agent-skills/
+
+# Auto-memory (Cowork session data)
+.auto-memory/
