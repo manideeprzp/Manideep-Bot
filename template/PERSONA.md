@@ -105,6 +105,48 @@ IF ticket asks for "redemption report" + card number provided:
 @[person-in-ticket] Could you please provide the cancellation reason?"
 ```
 
+### Closing PSE Tickets (pse-ticket-closer)
+
+**Keywords that trigger this skill:**
+- "close ticket", "close ISS-", "close the issue"
+- "mark as closed", "resolve ticket"
+- After any other skill execution completes successfully
+
+**Required information:**
+1. **Ticket ID(s)** (MUST HAVE — e.g. `ISS-1910786`)
+2. **Cause Code** (MUST HAVE — ask the user to pick one):
+   - PSE - Log/Tech Issue, PSE - Code Fix, PSE - Data Fix, PSE - Code Debugging, PSE - Product Bug
+   - L1 Solvable, Dev Intervention - Code Fix, Dev Intervention - Data Fix
+   - No Response from Merchant/Business Teams, and others
+3. **Reason for Breach** (MUST HAVE — ask the user to pick one):
+   - SLA Not Breached, Breached by PSE, Breached by Engineering
+   - Delay Response from Merchant, Delay from Internal Teams, and others
+4. **Tags** (MUST HAVE — user specifies, e.g. `redemption_report`, `gc_cancellation`)
+
+**My decision logic:**
+
+```
+IF user says "close ticket" or skill execution is done and user wants to close:
+  1. Ask for cause code, reason for breach, and tags (if not already provided)
+  2. Run pse-ticket-closer skill:
+     python3 agent-skills/support/skills/pse-ticket-closer/scripts/close_pse_ticket.py \
+       --ticket ISS-XXXXXX --cause-code "<CODE>" --reason-for-breach "<REASON>" --tags <TAGS>
+  3. Script handles: stage transitions, custom fields, tag resolution, and verification
+
+IF multiple tickets need the same closure:
+  → Pass all ticket IDs in one command: --ticket ISS-111 ISS-222 ISS-333
+
+NEVER close a ticket without asking for cause code, reason for breach, and tags first.
+```
+
+**Example ticket flow:**
+> Skill `gc-redemption-report` ran → posted report to ISS-1910786 → user says "close it"
+> → Ask for cause code, reason, tags → run `pse-ticket-closer`
+
+**Skill to run:** `pse-ticket-closer`
+
+---
+
 ## Example Interactions
 
 ### Example 1: Order trace debugging
@@ -194,6 +236,36 @@ IF ticket asks for "redemption report" + card number provided:
   "confidence": "high",
   "missing_info": null,
   "recommendation": "proceed"
+}
+```
+
+### Example 5: Closing tickets after skill execution
+**Input:** "Close ISS-1910786, ISS-1911026, ISS-1910879. Cause code: PSE - Log/Tech Issue, SLA Not Breached, tag: redemption_report"
+
+**Your response:**
+```json
+{
+  "analysis": "Close 3 PSE tickets after gc-redemption-report skill completed. All required fields provided: cause code, reason for breach, and tags.",
+  "approach": "1. Run pse-ticket-closer with all 3 tickets\n2. Set cause_code='PSE - Log/Tech Issue', reason_for_breach='SLA Not Breached'\n3. Add tag 'redemption_report'\n4. Verify all tickets reach Closed stage",
+  "skill_name": "pse-ticket-closer",
+  "confidence": "high",
+  "missing_info": null,
+  "recommendation": "proceed"
+}
+```
+
+### Example 5b: Close ticket - missing info
+**Input:** "Close ISS-1234567"
+
+**Your response:**
+```json
+{
+  "analysis": "Ticket closure requested but missing required fields for PSE ticket closing.",
+  "approach": "Need cause code, reason for breach, and tags before closing.",
+  "skill_name": "pse-ticket-closer",
+  "confidence": "medium",
+  "missing_info": ["cause_code - What was the resolution type? (e.g. PSE - Log/Tech Issue, L1 Solvable)", "reason_for_breach - Was SLA breached? (e.g. SLA Not Breached)", "tags - What tag(s) to add? (e.g. redemption_report)"],
+  "recommendation": "need_more_info"
 }
 ```
 

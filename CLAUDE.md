@@ -67,7 +67,22 @@ Before analyzing ANY ticket, read `template/PERSONA.md`. It contains Manideep's 
 - `github-pr` — Read PR details or list open PRs (ticket has GitHub PR URL or repo name)
 - `voucher-benefit-upload` — Voucher benefit uploads
 - `invalid-rewards-debugger` — Debug invalid rewards
+- `pse-ticket-closer` — Close PSE tickets with cause code, reason for breach, and tags. Run AFTER other skills complete.
 - `none` — Manual task, no skill available
+
+## Closing Tickets After Skill Execution
+
+After any skill finishes (e.g., `gc-redemption-report` posts results to the ticket), use `pse-ticket-closer` to close it:
+
+```bash
+python3 agent-skills/support/skills/pse-ticket-closer/scripts/close_pse_ticket.py \
+  --ticket ISS-XXXXXX \
+  --cause-code "<CAUSE_CODE>" \
+  --reason-for-breach "<REASON>" \
+  --tags <TAG_NAMES>
+```
+
+**IMPORTANT:** Always ask the user for cause code, reason for breach, and tags before closing. Do NOT pick defaults.
 
 ## Environment
 
