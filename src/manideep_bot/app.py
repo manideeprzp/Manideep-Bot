@@ -17,6 +17,7 @@ Two distinct channels:
 import logging
 import os
 import re
+import time
 
 from .config import load_config
 from .agent import reply
@@ -553,6 +554,28 @@ def run_slack_bot():
                     if msg.get("bot_id") and "Analysis:" in msg.get("text", ""):
                         recovered_ticket_text = msg_text[:3000]
                 if recovered_skill:
+                    # Re-fetch full ticket body from DevRev (thread history only has analysis text)
+                    if recovered_display_id and not recovered_ticket_text:
+                        try:
+                            from . import devrev_client as _dc
+                            _work = _dc.get_work_by_display_id(recovered_display_id)
+                            if _work:
+                                _title = (_work.get("title") or "")
+                                _body = (_work.get("body") or "")[:3000]
+                                recovered_ticket_text = f"{_title}\n\n{_body}".strip()
+                        except Exception:
+                            pass
+                    # Even if we have analysis text, re-fetch to get card numbers etc.
+                    if recovered_display_id and recovered_ticket_text and not re.search(r"\d{10,}", recovered_ticket_text):
+                        try:
+                            from . import devrev_client as _dc
+                            _work = _dc.get_work_by_display_id(recovered_display_id)
+                            if _work:
+                                _title = (_work.get("title") or "")
+                                _body = (_work.get("body") or "")[:3000]
+                                recovered_ticket_text = f"{_title}\n\n{_body}".strip()
+                        except Exception:
+                            pass
                     state = {
                         "step": "suggested",
                         "skill_name": recovered_skill,
@@ -692,7 +715,7 @@ def run_slack_bot():
                 say(text=f":warning: {out}", thread_ts=thread_ts)
                 return
             say(
-                text=f"Work done. Output:\n```\n{out[:2500]}\n```\n\nReply *Approve* to post this on the ticket and close it.",
+                text=f"{out[:2500]}\n\nReply *Approve* to post this on the ticket and close it.",
                 thread_ts=thread_ts,
             )
             state["step"] = "pending_approve"
@@ -750,7 +773,7 @@ def run_slack_bot():
                 say(text=f":warning: {out}", thread_ts=thread_ts)
                 return
             say(
-                text=f"Work done. Output:\n```\n{out[:2500]}\n```\n\nReview. If correct, reply **Approve** to post this on the ticket and close it.",
+                text=f"{out[:2500]}\n\nReview. If correct, reply *Approve* to post this on the ticket and close it.",
                 thread_ts=thread_ts,
             )
             state["step"] = "pending_approve"
@@ -776,54 +799,135 @@ def run_slack_bot():
 
         if cmd == "approve" and state.get("step") == "pending_approve":
             work_id = state.get("work_id")
-            if not work_id:
+            display_id = state.get("display_id") or ""
+            if not work_id and not display_id:
                 say(
                     text="I don't have the ticket ID. Please paste the DevRev work ID (e.g. ISS-123) so I can post the update and close it.",
                     thread_ts=thread_ts,
                 )
                 return
+
+            skill_name = (state.get("skill_name") or "").strip()
+
+            # Use pse-ticket-closer flow: ask for cause code, breach reason, tags
+            prompt = (
+                f":ticket: *Closing {display_id}* — let's fill in the required fields.\n\n"
+                f"*1. Cause Code* (pick a number):\n"
+                f"```\n{_numbered_list(_CAUSE_CODES)}\n```\n\n"
+                f"*2. Reason for Breach* (pick a number):\n"
+                f"```\n{_numbered_list(_BREACH_REASONS)}\n```\n\n"
+                f"*3. Tags* (comma-separated, e.g. `redemption_report`)\n\n"
+                f"Reply with:\n"
+                f"```\n"
+                f"cause_code: <number>\n"
+                f"breach_reason: <number>\n"
+                f"tags: tag1, tag2\n"
+                f"```\n"
+                f"Or reply `quick` to close with defaults:\n"
+                f"  cause_code: `PSE - Log/Tech Issue` | breach_reason: `SLA Not Breached` | tag: `{skill_name or 'bot_resolved'}`"
+            )
+            say(text=prompt, thread_ts=thread_ts)
+
+            state["step"] = "awaiting_pse_close_info"
+            state["skill_name"] = skill_name
+            if is_bucket:
+                bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+            else:
+                _thread_state[key] = state
+            return
+
+        # ── PSE ticket closer step: run close_pse_ticket.py ────────────────
+        if state.get("step") == "awaiting_pse_close_info":
+            display_id = state.get("display_id") or ""
+            skill_name = (state.get("skill_name") or "").strip()
+            summary = state.get("summary") or state.get("output") or "Resolved by Manideep Bot."
+
+            raw_text = text.strip().lower()
+
+            # Quick close with defaults
+            if raw_text in ("quick", "q", "default", "defaults"):
+                cause_code = "PSE - Log/Tech Issue"
+                breach_reason = "SLA Not Breached"
+                tags_list = [skill_name] if skill_name and skill_name != "none" else ["bot_resolved"]
+            else:
+                # Parse structured fields
+                cause_raw = _extract_field(text,
+                    r"^cause_?code[\s:：]+(.+)$",
+                    r"cause_?code[\s:：]+(.+)")
+                breach_raw = _extract_field(text,
+                    r"^breach_?reason[\s:：]+(.+)$",
+                    r"^reason_?for_?breach[\s:：]+(.+)$",
+                    r"breach_?reason[\s:：]+(.+)")
+                tags_raw = _extract_field(text,
+                    r"^tags?[\s:：]+(.+)$",
+                    r"tags?[\s:：]+(.+)")
+
+                cause_code = _pick_from_list(cause_raw, _CAUSE_CODES) if cause_raw else ""
+                breach_reason = _pick_from_list(breach_raw, _BREACH_REASONS) if breach_raw else ""
+                tags_list = [t.strip() for t in re.split(r"[,;]", tags_raw) if t.strip()] if tags_raw else []
+
+                # Add skill tag if not already present
+                if skill_name and skill_name != "none":
+                    skill_tag = skill_name
+                    if skill_tag not in tags_list:
+                        tags_list.append(skill_tag)
+                if not tags_list:
+                    tags_list = ["bot_resolved"]
+
+                if not cause_code:
+                    say(text=":warning: Cause code not recognized. Pick a number from the list above or type `quick` for defaults.", thread_ts=thread_ts)
+                    return
+                if not breach_reason:
+                    say(text=":warning: Breach reason not recognized. Pick a number from the list above or type `quick` for defaults.", thread_ts=thread_ts)
+                    return
+
+            # Close using devrev_client directly (no subprocess, no API timeouts)
+            say(text=f":hourglass_flowing_sand: Closing `{display_id}`...", thread_ts=thread_ts)
+
             try:
                 from . import devrev_client
-                from .claude_code_agent import load_similar_data
-
-                skill_name = (state.get("skill_name") or "").strip()
-                display_id = state.get("display_id") or ""
-
-                # Load similar ticket data (tags + fields saved during analysis)
-                similar_data = load_similar_data(display_id) if display_id else {}
-                similar_tags = similar_data.get("suggested_tags") or []
-                similar_fields = similar_data.get("suggested_fields") or {}
-                similar_tickets = similar_data.get("similar_tickets") or []
-                best_similar_id = similar_tickets[0].get("display_id", "") if similar_tickets else ""
-
-                # Build proposed tags — show to user for validation before closing
-                tags_to_add = devrev_client.build_tags_for_closure(
-                    skill_name=skill_name,
-                    similar_ticket_tags=similar_tags,
+                comment_text = f"Resolved via Manideep Bot skill: {skill_name}.\n\n{summary[:500]}"
+                success, log_output = devrev_client.pse_close_ticket(
+                    display_id=display_id,
+                    cause_code=cause_code,
+                    reason_for_breach=breach_reason,
+                    tag_names=tags_list,
+                    comment=comment_text,
                 )
-                tag_names = [t["name"] for t in tags_to_add]
-                tag_preview = ", ".join(f"`{n}`" for n in tag_names) if tag_names else "_none_"
 
-                preview_msg = (
-                    f":label: *Tag preview for {display_id or work_id}:*\n"
-                    f"{tag_preview}\n\n"
-                    f"Reply *confirm* to close with these tags.\n"
-                    f"Or override: `tags: tag1, tag2` (replaces the list above)."
-                )
-                say(text=preview_msg, thread_ts=thread_ts)
+                if success:
+                    say(
+                        text=(
+                            f":white_check_mark: *{display_id} closed!*\n\n"
+                            f":label: *Cause code:* `{cause_code}`\n"
+                            f":clipboard: *Breach reason:* `{breach_reason}`\n"
+                            f":bookmark: *Tags:* {', '.join(f'`{t}`' for t in tags_list)}\n\n"
+                            f"```\n{log_output[-800:]}\n```"
+                        ),
+                        thread_ts=thread_ts,
+                    )
 
-                # Stash everything needed for the actual close
-                state["step"] = "pending_tag_confirm"
-                state["tags_to_add"] = tags_to_add
-                state["similar_fields"] = similar_fields
-                state["best_similar_id"] = best_similar_id
-                if is_bucket:
-                    bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
+                    # Append to solved tickets for learning
+                    try:
+                        from .monitor import append_solved_ticket_after_approve
+                        work_id = state.get("work_id") or ""
+                        if work_id:
+                            append_solved_ticket_after_approve(config, work_id)
+                    except Exception:
+                        pass
                 else:
-                    _thread_state[key] = state
+                    say(text=f":x: Close failed:\n```\n{log_output[-1000:]}\n```", thread_ts=thread_ts)
+                    return  # keep state so user can retry
             except Exception as e:
-                logger.exception("DevRev tag preview: %s", e)
-                say(text=f"Failed to build tag preview: {e}", thread_ts=thread_ts)
+                logger.exception("pse_close_ticket error for %s", display_id)
+                say(text=f":x: Error closing ticket: {e}", thread_ts=thread_ts)
+                return
+
+            # Clean up state
+            if is_bucket:
+                bucket_mod.pop_bucket_thread_state(ch, thread_ts)
+            else:
+                _thread_state.pop(key, None)
             return
 
         # ── Tag-confirmation step: user validates tags before close ──────────
@@ -955,8 +1059,8 @@ def run_slack_bot():
             # Check if user already has too many tickets
             try:
                 current_count = devrev_client.count_open_tickets_for_user(my_user_id)
-                if current_count >= 15:
-                    skip_reason = f"Already have {current_count} open tickets (limit: 15)"
+                if current_count >= 10:
+                    skip_reason = f"Already have {current_count} open tickets (limit: 10)"
                     logger.info("Skipping auto-assign for %s: %s", display_id, skip_reason)
                 else:
                     devrev_client.work_assign(work_id, my_user_id)
@@ -1064,6 +1168,7 @@ def run_slack_bot():
                         "display_id": display_id,
                         "ticket_text": ticket_text,
                         "skill_name": skill_name,
+                        "awaiting_info": True,
                     })
             else:
                 # Manual skill — wait for "Yes"

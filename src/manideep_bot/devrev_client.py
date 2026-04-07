@@ -495,3 +495,129 @@ def build_tags_for_closure(
             seen.add(name)
 
     return tags
+
+
+# ── PSE Ticket Closer (inline, no subprocess) ─────────────────────────────
+
+_CUSTOM_SCHEMA_FRAGMENT = "don:core:dvrv-in-1:devo/2sRI6Hepzz:custom_type_fragment/17324"
+_PSE_STAGE_PATH = ["acknowledged", "Under Investigation", "PSE Fixing", "Closed"]
+
+
+def pse_close_ticket(
+    display_id: str,
+    cause_code: str,
+    reason_for_breach: str,
+    tag_names: list[str],
+    comment: str = "",
+) -> tuple[bool, str]:
+    """
+    Close a PSE ticket with proper stage transitions, custom fields, and tags.
+    Returns (success, log_output).
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    lines = []
+
+    def _line(msg):
+        lines.append(msg)
+        _log.info("pse_close: %s", msg)
+
+    # 1. Get work
+    num = display_id.replace("ISS-", "").replace("iss-", "")
+    work_id = f"don:core:dvrv-in-1:devo/2sRI6Hepzz:issue/{num}"
+    _line(f"--- {display_id} ---")
+
+    work = work_get(work_id)
+    if not work:
+        _line(f"ERROR: Could not fetch {display_id}")
+        return False, "\n".join(lines)
+
+    current_stage = ((work.get("stage") or {}).get("name") or "unknown").lower()
+    _line(f"Current stage: {current_stage}")
+
+    # 2. Add comment
+    if comment:
+        try:
+            timeline_entry_create(work_id, comment, visibility="internal")
+            _line("Comment: OK")
+        except Exception as e:
+            _line(f"Comment failed: {e}")
+
+    # 3. Set custom fields (cause_code + reason_for_breach)
+    try:
+        payload = {
+            "id": work_id,
+            "type": "issue",
+            "custom_schema_fragments": [_CUSTOM_SCHEMA_FRAGMENT],
+            "custom_fields": {
+                "ctype__cause_code": cause_code,
+                "ctype__reason_for_breach": reason_for_breach,
+            },
+        }
+        r = _request_with_retry("POST", f"{DEVREV_BASE}/works.update", headers=_headers(), json=payload)
+        resp = r.json()
+        if resp.get("message"):
+            _line(f"Custom fields FAILED: {resp['message']}")
+        else:
+            _line("Custom fields: OK")
+    except Exception as e:
+        _line(f"Custom fields error: {e}")
+
+    # 4. Add tags
+    if tag_names:
+        tag_objects = [{"name": t, "value": ""} for t in tag_names]
+        try:
+            # Merge with existing tags
+            existing_tags = (work.get("tags") or [])
+            existing_names = {(t.get("tag") or {}).get("name") for t in existing_tags}
+            combined = list(existing_tags)
+            for tag in tag_objects:
+                if tag["name"] not in existing_names:
+                    combined.append({"tag": {"name": tag["name"]}, "value": tag.get("value", "")})
+            r = _request_with_retry("POST", f"{DEVREV_BASE}/works.update", headers=_headers(), json={
+                "id": work_id, "tags": combined,
+            })
+            resp = r.json()
+            if resp.get("message"):
+                _line(f"Tags FAILED: {resp['message']}")
+            else:
+                _line(f"Tags: OK ({len(tag_names)} added)")
+        except Exception as e:
+            _line(f"Tags error: {e}")
+
+    # 5. Transition stages: walk through PSE path to Closed
+    path_lower = [s.lower() for s in _PSE_STAGE_PATH]
+    start_idx = 0
+    for i, stage in enumerate(path_lower):
+        if current_stage == stage:
+            start_idx = i + 1
+            break
+
+    remaining = _PSE_STAGE_PATH[start_idx:]
+    if current_stage == "closed":
+        _line("Already Closed")
+    elif not remaining:
+        remaining = _PSE_STAGE_PATH  # unknown stage, try full path
+
+    for stage_name in remaining:
+        try:
+            r = _request_with_retry("POST", f"{DEVREV_BASE}/works.update", headers=_headers(), json={
+                "id": work_id, "type": "issue", "stage": {"name": stage_name},
+            })
+            resp = r.json()
+            actual = (resp.get("work") or {}).get("stage", {}).get("name", "")
+            error = resp.get("message", "")
+            if error and not actual:
+                _line(f"-> {stage_name}: FAILED ({error})")
+            else:
+                _line(f"-> {stage_name}: OK")
+        except Exception as e:
+            _line(f"-> {stage_name}: ERROR ({e})")
+
+    # 6. Verify
+    final_work = work_get(work_id)
+    final_stage = ((final_work or {}).get("stage") or {}).get("name", "unknown").lower()
+    success = final_stage == "closed"
+    _line(f"Result: {'CLOSED' if success else f'FAILED (stage: {final_stage})'}")
+
+    return success, "\n".join(lines)

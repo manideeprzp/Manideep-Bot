@@ -64,6 +64,36 @@ _GC_CANCELLATION_SCRIPT = _find_skill_script(
 )
 
 
+def _format_redemption_report(raw_output: str, card_numbers: list) -> str:
+    """Format gc-redemption-report output into a clean Slack message with emojis."""
+    # Extract all Google Sheets URLs from the raw output
+    sheet_urls = re.findall(r"https://docs\.google\.com/spreadsheets/[^\s\)]+", raw_output)
+
+    lines = [":gift: *GC Redemption Report*\n"]
+
+    if card_numbers and sheet_urls:
+        lines.append(f":page_facing_up: Here are the reports for *{len(card_numbers)}* card(s):\n")
+        for i, card in enumerate(card_numbers):
+            url = sheet_urls[i] if i < len(sheet_urls) else (sheet_urls[-1] if sheet_urls else "")
+            lines.append(f":credit_card: *Card {i+1}:* `{card}`")
+            if url:
+                lines.append(f"   :bar_chart: <{url}|View Report>\n")
+            else:
+                lines.append("")
+    elif card_numbers:
+        # No URLs found — just show card numbers with raw output
+        lines.append(f":page_facing_up: Report generated for *{len(card_numbers)}* card(s):\n")
+        for i, card in enumerate(card_numbers):
+            lines.append(f":credit_card: *Card {i+1}:* `{card}`")
+        lines.append(f"\n{raw_output[:1500]}")
+    else:
+        lines.append(raw_output[:2000])
+
+    lines.append("\n:white_check_mark: Please review the spreadsheet and reply *Approve* to post on the ticket and close it.")
+
+    return "\n".join(lines)
+
+
 def _find_order_id(text: str) -> str:
     """Extract order_id from ticket body/title (e.g. order_123 or order-id: xyz)."""
     if not text:
@@ -117,7 +147,44 @@ def _find_card_number(text: str) -> str:
     m = re.search(r"\b([A-Z]{2}[0-9]{9,})\b", text, re.I)
     if m:
         return m.group(1).strip()
+    # Last resort: bare numeric card number on its own line (10–19 digits)
+    # Handles tickets where card numbers are listed without a "Card number:" label
+    m = re.search(r"(?:^|\s)([0-9]{10,19})(?:\s|$)", text)
+    if m:
+        return m.group(1).strip()
     return ""
+
+
+def _find_all_card_numbers(text: str) -> list:
+    """
+    Extract ALL GC card numbers from ticket body (handles multi-card tickets).
+    Returns a deduplicated list preserving order.
+    """
+    if not text:
+        return []
+    seen = set()
+    results = []
+
+    def _add(val):
+        v = val.strip()
+        if v and v not in seen:
+            seen.add(v)
+            results.append(v)
+
+    # Explicit "card number: XXXX" lines
+    for m in re.finditer(r"card[_\s-]?number[\s:=]+([A-Za-z0-9]+)", text, re.I):
+        _add(m.group(1))
+    # GC-prefixed codes
+    for m in re.finditer(r"\b(GC[A-Z0-9]{6,})\b", text, re.I):
+        _add(m.group(1))
+    # 2-letter + 9+ digit codes
+    for m in re.finditer(r"\b([A-Z]{2}[0-9]{9,})\b", text, re.I):
+        _add(m.group(1))
+    # Bare 10–19 digit numeric codes (one per line)
+    for m in re.finditer(r"(?:^|\s)([0-9]{10,19})(?:\s|$)", text):
+        _add(m.group(1))
+
+    return results
 
 
 def _find_url(text: str) -> str:
@@ -330,8 +397,9 @@ def run_skill(skill_name: str, ticket_text: str, ticket_id: str = "") -> tuple[s
 
     # GC Redemption Report
     elif skill_name in ("gc-redemption-report", "redemption-report", "redemption_report"):
-        card_number = _find_card_number(ticket_text)
-        if not card_number:
+        # Collect ALL card numbers from the ticket (handles multi-card tickets)
+        card_numbers = _find_all_card_numbers(ticket_text)
+        if not card_numbers:
             return (
                 "Card number not found in the ticket body.\n"
                 "Please reply with:\n`card number: <your_card_number>`"
@@ -343,7 +411,7 @@ def run_skill(skill_name: str, ticket_text: str, ticket_id: str = "") -> tuple[s
             import sys
             py = sys.executable or "python3"
             out = subprocess.run(
-                [py, str(script), "--card-numbers", card_number],
+                [py, str(script), "--card-numbers"] + card_numbers,
                 capture_output=True,
                 text=True,
                 timeout=180,  # Redash queries can be slow
@@ -352,8 +420,10 @@ def run_skill(skill_name: str, ticket_text: str, ticket_id: str = "") -> tuple[s
             if out.returncode != 0:
                 return (out.stderr or out.stdout or "Script failed").strip()[:3000], False
             raw = (out.stdout or "Done. Check the sheet link above.").strip()
-            analyzed = _analyze_with_claude_code(raw, "gc-redemption-report", ticket_text)
-            return analyzed[:3000], True
+            # Format a clean Slack message with card numbers and sheet links
+            # instead of passing through Claude CLI (which can't read sheet URLs)
+            formatted = _format_redemption_report(raw, card_numbers)
+            return formatted[:3000], True
         except subprocess.TimeoutExpired:
             return "Script timed out (180s). Redash query may be slow.", False
         except Exception as e:
