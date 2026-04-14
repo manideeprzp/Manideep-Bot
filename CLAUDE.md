@@ -67,6 +67,7 @@ Before analyzing ANY ticket, read `template/PERSONA.md`. It contains Manideep's 
 - `github-pr` — Read PR details or list open PRs (ticket has GitHub PR URL or repo name)
 - `voucher-benefit-upload` — Voucher benefit uploads
 - `invalid-rewards-debugger` — Debug invalid rewards
+- `wallet-closure` — Process wallet closure/refund requests. Parses DevRev ticket, queries Redash for user_id and reversal amounts, fetches admin token, executes closure curl, comments result on ticket. Tag: `wallet_closure`
 - `pse-ticket-closer` — Close PSE tickets with cause code, reason for breach, and tags. Run AFTER other skills complete.
 - `none` — Manual task, no skill available
 
@@ -84,9 +85,32 @@ python3 agent-skills/support/skills/pse-ticket-closer/scripts/close_pse_ticket.p
 
 **IMPORTANT:** Always ask the user for cause code, reason for breach, and tags before closing. Do NOT pick defaults.
 
+## Posting Comments on DevRev Tickets
+
+**ALWAYS use DevRev MCP tools** to post comments on tickets. Do NOT use curl/API directly.
+
+```
+Use MCP tool: add_comment / create_timeline_entry
+- object: don:core:dvrv-in-1:devo/2sRI6Hepzz:issue/XXXXXX
+- body: your comment text
+- visibility: external (visible to reporter) or internal
+```
+
+Links in comments must use markdown format: `[text](url)` — plain URLs work but markdown is preferred.
+
+## GC Redemption Report — Google Sheets
+
+The `gc-redemption-report` skill writes to this shared Google Sheet:
+- **Spreadsheet ID:** `1FKyIukL9VoMZYsyabk204EELYqeWSKQHs5AXwPBHJP0`
+- **URL:** https://docs.google.com/spreadsheets/d/1FKyIukL9VoMZYsyabk204EELYqeWSKQHs5AXwPBHJP0/edit
+- Each card gets its own tab (e.g. `Card_7100155263348049`)
+- Always use `--spreadsheet-id` flag (or config.json has it) — never output CSV only
+- After running the skill, post the per-card Google Sheet links on the DevRev ticket using MCP
+
 ## Environment
 
 - DevRev API key is in `scripts/.env` as `DEVREV_API_KEY`
+- Redash Wallet: `REDASH_WALLET_API_KEY` / `REDASH_WALLET_URL` in `scripts/.env`
 - Bot watcher auto-posts responses to Slack when files appear in `data/claude_responses/`
 - Load env: `source scripts/.env` or `export $(grep -v '^#' scripts/.env | grep '=' | xargs)`
 

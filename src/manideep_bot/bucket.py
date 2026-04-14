@@ -30,8 +30,8 @@ def _load_bucket_state() -> dict:
         try:
             with open(_BUCKET_STATE_FILE) as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Bucket state file corrupted, starting fresh: %s", e)
     return {}
 
 
@@ -63,6 +63,53 @@ def pop_bucket_thread_state(channel_id: str, thread_ts: str):
     _save_bucket_state(state)
 
 
+# ── Ticket → Slack thread mapping ────────────────────────────────────────────
+# Stores: display_id (ISS-XXXXXX) → {channel, thread_ts, last_timeline_id}
+# Used so monitor updates always reply in the SAME Slack thread, not a new one.
+
+_TICKET_THREADS_FILE = _BOT_ROOT / "data" / "assigned_ticket_threads.json"
+
+
+def _load_ticket_threads() -> dict:
+    if _TICKET_THREADS_FILE.exists():
+        try:
+            with open(_TICKET_THREADS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_ticket_threads(data: dict):
+    _TICKET_THREADS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_TICKET_THREADS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def save_ticket_thread(display_id: str, channel: str, thread_ts: str, last_timeline_id: str = ""):
+    """Save the Slack thread for a ticket so monitor updates reply there."""
+    data = _load_ticket_threads()
+    data[display_id] = {
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "last_timeline_id": last_timeline_id,
+    }
+    _save_ticket_threads(data)
+
+
+def get_ticket_thread(display_id: str) -> dict | None:
+    """Return {channel, thread_ts, last_timeline_id} for a ticket, or None."""
+    return _load_ticket_threads().get(display_id)
+
+
+def update_ticket_thread_timeline(display_id: str, last_timeline_id: str):
+    """Update the last seen timeline entry ID for a ticket."""
+    data = _load_ticket_threads()
+    if display_id in data:
+        data[display_id]["last_timeline_id"] = last_timeline_id
+        _save_ticket_threads(data)
+
+
 def fetch_my_bucket_works(config: Config) -> list[dict]:
     """Fetch work items assigned to me in open states (full objects with title, body)."""
     from . import devrev_client
@@ -82,8 +129,8 @@ def fetch_my_bucket_works(config: Config) -> list[dict]:
         )
         works = data.get("works") or []
         out.extend(works)
-        cursor = data.get("next_cursor")
-        if not cursor or not works:
+        cursor = data.get("next_cursor") or None
+        if cursor is None or not works:
             break
     return out
 

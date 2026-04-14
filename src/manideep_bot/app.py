@@ -85,6 +85,7 @@ _AUTO_RUN_SKILLS = {
     "vishnu-terraform-kong-pr",
     "invalid-rewards-debugger",
     "github-pr",  # Read-only: fetch PR details / list PRs
+    "wallet-closure",  # Wallet closure via Claude Code CLI
 }
 
 # ── DevRev PSE dropdown enums (from ctype__custom_type_fragment/17305) ───────
@@ -265,7 +266,7 @@ _KNOWN_SKILLS = {
     "gc-redemption-report", "gc-cancellation", "cancel-gc",
     "order-trace-debugger", "vishnu-terraform-kong-pr", "vishnu-kong-pr",
     "kong-pr", "dns-pr", "github-pr", "voucher-benefit-upload",
-    "invalid-rewards-debugger", "rmp-gandalf",
+    "invalid-rewards-debugger", "rmp-gandalf", "wallet-closure",
 }
 
 
@@ -327,6 +328,166 @@ def _get_analysis(ticket_text: str, config, ticket_id: str = None, channel: str 
     else:
         logger.info("No API key - using Claude Code local analysis")
         return claude_code_reply(ticket_text, config, ticket_id, channel, thread_ts)
+
+
+def _handle_check(event: dict, say, config, slack_client=None):
+    """
+    Handle '@bot check' from Slack — two actions:
+    1. Process all pending claude_requests (unassigned tickets queued for analysis)
+    2. Surface assigned tickets that have no Slack thread yet (create one per ticket)
+    Everything stays in Slack. No new Claude sessions spawned.
+    """
+    from pathlib import Path
+    from .response_watcher import save_thread_mapping
+    from . import bucket as bucket_mod
+
+    requests_dir = Path(__file__).resolve().parents[2] / "data" / "claude_requests"
+    responses_dir = Path(__file__).resolve().parents[2] / "data" / "claude_responses"
+    channel = event.get("channel")
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    bucket_ch = (config.slack.bucket_channel_id or "").strip() or channel
+
+    # Load auto_watcher deps once
+    import sys
+    scripts_dir = str(Path(__file__).resolve().parents[2] / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    try:
+        from auto_watcher import analyze as aw_analyze, _load_deps
+        detect_skill_fn, find_relevant, format_relevant, load_config = _load_deps()
+        aw_config = load_config()
+        deps = {
+            "detect_skill": detect_skill_fn,
+            "find_relevant": find_relevant,
+            "format_relevant": format_relevant,
+            "config": aw_config,
+        }
+    except Exception as e:
+        logger.error("Failed to load auto_watcher: %s", e)
+        say(text=f":x: Could not load analysis engine: {e}", thread_ts=thread_ts)
+        return
+
+    # ── Part 1: Process pending unassigned request files ────────────────────
+    pending = [
+        f for f in requests_dir.glob("ISS-*.md")
+        if not (responses_dir / f.name).exists()
+    ]
+
+    processed = 0
+    if pending:
+        say(
+            text=f":hourglass_flowing_sand: Processing *{len(pending)}* pending ticket{'s' if len(pending) > 1 else ''}...",
+            thread_ts=thread_ts,
+        )
+        for req_file in pending:
+            ticket_id = req_file.stem
+            try:
+                response_text = aw_analyze(req_file, deps)
+                resp_file = responses_dir / req_file.name
+                resp_file.write_text(response_text)
+                save_thread_mapping(ticket_id, channel, thread_ts)
+                bucket_mod.save_ticket_thread(ticket_id, channel, thread_ts)
+                processed += 1
+                logger.info("check: analysed %s", ticket_id)
+            except Exception as e:
+                logger.error("check: failed to analyse %s: %s", ticket_id, e)
+                say(text=f":x: Failed to analyse `{ticket_id}`: {e}", thread_ts=thread_ts)
+
+        if processed:
+            say(
+                text=f":white_check_mark: Done — *{processed}* ticket{'s' if processed > 1 else ''} analysed. Results posting now...",
+                thread_ts=thread_ts,
+            )
+
+    # ── Part 2: Assigned tickets with no Slack thread yet ───────────────────
+    if not slack_client:
+        if not pending:
+            say(text=":white_check_mark: No pending tickets — all clear!", thread_ts=thread_ts)
+        return
+
+    try:
+        from . import devrev_client
+        from .enhanced_agent import detect_skill as _detect_skill
+        from .response_watcher import _post_formatted
+
+        my_user_id = (config.devrev.my_user_id or "").strip()
+        if not my_user_id:
+            if not pending:
+                say(text=":white_check_mark: No pending tickets — all clear!", thread_ts=thread_ts)
+            return
+
+        user = devrev_client.get_self()
+        user_id = user.get("id") or my_user_id
+
+        data = devrev_client.works_list(
+            owned_by=[user_id],
+            state=config.monitor.my_tickets_states,
+            limit=30,
+        )
+        assigned_works = data.get("works") or []
+
+        no_thread = [
+            w for w in assigned_works
+            if not bucket_mod.get_ticket_thread(w.get("display_id") or "")
+        ]
+
+        if not no_thread:
+            if not pending:
+                say(text=":white_check_mark: All caught up — no pending tickets and all assigned tickets have threads.", thread_ts=thread_ts)
+            return
+
+        say(
+            text=f":file_folder: Found *{len(no_thread)}* assigned ticket{'s' if len(no_thread) > 1 else ''} with no thread — creating now...",
+            thread_ts=thread_ts,
+        )
+
+        app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
+        for w in no_thread[:10]:
+            display_id = w.get("display_id") or w.get("id", "")
+            title = (w.get("title") or "")[:100]
+            body = (w.get("body") or "")[:2000]
+            stage_name = (w.get("stage") or {}).get("name") or "Unknown"
+            ticket_text = f"{title}\n\n{body}".strip()
+
+            try:
+                skill_name, confidence = _detect_skill(ticket_text)
+                skill_name = skill_name or "none"
+
+                ticket_url = f"{app_base}/razorpay/issue/{display_id}"
+                post_result = slack_client.chat_postMessage(
+                    channel=bucket_ch,
+                    text=f"{display_id} — {title}",
+                    attachments=[{
+                        "color": "#6B47DC",
+                        "title": f"{display_id} — {title}",
+                        "title_link": ticket_url,
+                        "text": f"Stage: `{stage_name}` | Assigned to you",
+                        "footer": "DevRev · PSE · My Tickets",
+                    }],
+                )
+                posted_ts = post_result["ts"]
+
+                from .scripts_utils import build_inline_analysis
+                response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
+                _post_formatted(slack_client, bucket_ch, posted_ts, display_id, response)
+
+                bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
+                bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                    "step": "suggested",
+                    "work_id": w.get("id", ""),
+                    "display_id": display_id,
+                    "ticket_text": ticket_text,
+                    "skill_name": skill_name,
+                })
+                logger.info("check: created thread for assigned ticket %s", display_id)
+            except Exception as e:
+                logger.error("check: failed to create thread for %s: %s", display_id, e)
+
+    except Exception as e:
+        logger.error("check: assigned ticket scan failed: %s", e)
+        if not pending:
+            say(text=":white_check_mark: No pending tickets — all clear!", thread_ts=thread_ts)
 
 
 def _handle_close_request(display_id: str, event: dict, say, config, thread_key: tuple):
@@ -402,11 +563,28 @@ def run_slack_bot():
 
     app = App(token=config.slack.bot_token)
 
-    from .response_watcher import start_response_watcher, save_thread_mapping
+    from .response_watcher import start_response_watcher, start_pending_notifier, save_thread_mapping
     start_response_watcher(app.client)
 
     watch_ch = (config.slack.watch_channel_id or "").strip()
     bucket_ch = (config.slack.bucket_channel_id or "").strip()
+
+    # Fetch the bot's own Slack user ID so the notifier can mention it correctly
+    _bot_user_id = ""
+    try:
+        _auth = app.client.auth_test()
+        _bot_user_id = _auth.get("user_id", "")
+    except Exception:
+        pass
+
+    # Notify user in Slack when new tickets arrive — user replies "@ManideepBot check"
+    # in Slack to trigger analysis. No Claude Code sessions spawned.
+    notify_ch = bucket_ch or watch_ch
+    if notify_ch:
+        start_pending_notifier(app.client, notify_ch, bot_user_id=_bot_user_id)
+        logger.info("Pending notifier started — will ping %s when new tickets land", notify_ch)
+    else:
+        logger.warning("No channel configured — pending notifier disabled (set bucket_channel_id)")
     my_user_id = (config.devrev.my_user_id or "").strip()
     svcacc_id = (config.devrev.unassigned_svcacc_id or "").strip()
 
@@ -445,6 +623,11 @@ def run_slack_bot():
         close_id = _parse_close_command(text)
         if close_id:
             _handle_close_request(close_id, event, say, config, _thread_key(event))
+            return
+
+        # ── Check command: @bot check — process all pending tickets now ────────
+        if text.lower().strip() in ("check", "check pending", "process"):
+            _handle_check(event, say, config, slack_client=client)
             return
 
         say(text=":hourglass_flowing_sand: Analysing...", thread_ts=thread_ts)
@@ -1052,6 +1235,22 @@ def run_slack_bot():
         ticket_text = f"{title}\n\n{body}".strip() or str(display_id)
         msg_ts = event.get("ts")
 
+        # ── PSE pod filter: skip tickets not belonging to our pods ─────────
+        allowed_pods = getattr(getattr(config, "monitor", None), "new_ticket_filter_pse_pods", None) or []
+        ticket_pod = (
+            (work.get("custom_fields") or {}).get("ctype__pse_pod") or
+            work.get("ctype__pse_pod") or ""
+        ).strip()
+        logger.info("Ticket %s — PSE pod: '%s' | allowed: %s", display_id, ticket_pod, allowed_pods)
+        if allowed_pods:
+            pod_set = {p.strip().lower() for p in allowed_pods if p}
+            if ticket_pod.lower() not in pod_set:
+                logger.info(
+                    "Skipping %s — PSE pod '%s' not in allowed pods",
+                    display_id, ticket_pod,
+                )
+                return False
+
         # ── Auto-assign if unassigned ──────────────────────────────────────
         assigned_now = False
         skip_reason = None
@@ -1100,6 +1299,10 @@ def run_slack_bot():
                 }],
             )
             posted_ts = notify_result["ts"]
+
+            # Save ticket → Slack thread mapping for monitor continuity
+            from . import bucket as _bucket_mod
+            _bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
 
             # 2. Get analysis
             result = _get_analysis(ticket_text, config, display_id)
@@ -1277,6 +1480,10 @@ def run_slack_bot():
                         }],
                     )
                     posted_ts = notify_result["ts"]
+
+                    # Save ticket → Slack thread mapping for monitor continuity
+                    from . import bucket as _bucket_mod_cu
+                    _bucket_mod_cu.save_ticket_thread(display_id, bucket_ch, posted_ts)
 
                     # Detect skill + post analysis
                     skill_name, confidence = _detect_skill(ticket_text)

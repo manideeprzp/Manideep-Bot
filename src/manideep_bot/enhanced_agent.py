@@ -47,6 +47,18 @@ ISSUE_PATTERNS = [
         r"|(balance|recharge|redeem|transaction|report).*\bgc\b",
         re.I), "gc-redemption-report"),
 
+    # Wallet closure — before order trace (closure keywords are specific)
+    (re.compile(
+        r"wallet\s*closure"
+        r"|close\s*wallet"
+        r"|closure\s*request"
+        r"|fund\s*reversal.*wallet|wallet.*fund\s*reversal"
+        r"|remaining\s*wallet\s*balance"
+        r"|reversed\s*the\s*funds"
+        r"|closer\s*wallet"
+        r"|wallet\s*account\s*clos",
+        re.I), "wallet-closure"),
+
     # Order trace
     (re.compile(
         r"order[_\s-]?id\s*[:=]"        # explicit order_id field
@@ -77,6 +89,8 @@ TAG_SKILL_MAP = {
     "rmp_gandalf": "rmp-gandalf",
     "rmp_order": "rmp-gandalf",
     "voucher_upload": "voucher-benefit-upload",
+    # Wallet closure
+    "wallet_closure": "wallet-closure",
     # DNS / Kong PR
     "dns_pr": "vishnu-terraform-kong-pr",
     "kong_pr": "vishnu-terraform-kong-pr",

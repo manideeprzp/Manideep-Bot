@@ -103,8 +103,8 @@ def _fetch_my_ticket_ids(config):
         )
         works = data.get("works") or []
         ids.extend([w["id"] for w in works])
-        cursor = data.get("next_cursor")
-        if not cursor or not works:
+        cursor = data.get("next_cursor") or None
+        if cursor is None or not works:
             break
     return ids
 
@@ -154,8 +154,8 @@ def _fetch_new_tickets(config):
         )
         works = data.get("works") or []
         out.extend(works)
-        cursor = data.get("next_cursor")
-        if not cursor or not works:
+        cursor = data.get("next_cursor") or None
+        if cursor is None or not works:
             break
     # Filter by stage name (e.g. "triage") – case-insensitive
     if stage_names:
@@ -210,17 +210,17 @@ def _get_latest_timeline_entry(work_id):
 def _parse_skill_name(text: str) -> str:
     """Extract skill name from agent response."""
     if not text:
-        return "order-trace-debugger"
+        return "none"
     import re
-    # Try structured format
-    m = re.search(r"\*\*skill\s+to\s+run:\*\*\s*([a-z0-9-]+)", text, re.I)
+    # Try structured format: **Skill to run:** gc-redemption-report
+    m = re.search(r"\*\*skill\s+to\s+run:\*\*\s*`?([a-z0-9-]+)`?", text, re.I)
     if m:
         return m.group(1).strip()
     # Try legacy format
-    m = re.search(r"skill[:\s]+([a-z0-9-]+)", text, re.I)
+    m = re.search(r"skill[:\s]+`?([a-z0-9-]+)`?", text, re.I)
     if m:
         return m.group(1).strip()
-    return "order-trace-debugger"
+    return "none"
 
 
 def run_once(config):
@@ -261,12 +261,12 @@ def run_once(config):
         except Exception as e:
             logger.warning("Timeline for %s: %s", wid, e)
 
-    state["last_timeline_by_work"] = {k: v for k, v in list(last_timeline.items())[:200]}
+    state["last_timeline_by_work"] = {k: v for k, v in list(last_timeline.items())[:500]}
     state["last_run_ts"] = time.time()
     _save_state(state)
 
     # Post to Slack: new PSE tickets with AI suggestion (analyze each) - INTERACTIVE
-    for w in new_tickets[:10]:
+    for w in new_tickets[:20]:
         title = (w.get("title") or "")[:200]
         body = (w.get("body") or "")[:3000]
         work_id = w.get("id")  # Full don:core:... ID
@@ -314,11 +314,12 @@ def run_once(config):
             skill_name=skill_name,
         )
 
-    # Post to Slack: assigned ticket updates with NEW CONTENT ANALYSIS - INTERACTIVE
-    for wid, latest_entry_id in new_replies[:10]:
+    # Post to Slack: assigned ticket updates — reply in the EXISTING Slack thread
+    for wid, latest_entry_id in new_replies[:20]:
         try:
             from . import devrev_client
-            from .agent import reply
+            from . import bucket as bucket_mod
+            from .enhanced_agent import detect_skill as _detect_skill
 
             # Fetch the work to get title and current state
             work_data = devrev_client.works_list(work_ids=[wid], limit=1)
@@ -333,55 +334,84 @@ def run_once(config):
             stage_name = (work.get("stage") or {}).get("name") or "Unknown"
 
             # Get the latest timeline entry content
-            _, new_content = _get_latest_timeline_entry(wid)
+            entry_id, new_content = _get_latest_timeline_entry(wid)
             if not new_content:
                 new_content = "(No text content in latest update)"
 
-            # Analyze the UPDATE (not the whole ticket)
+            # Skip our own bot comments to avoid loops
+            if "Manideep Bot" in new_content or "skill completed" in new_content.lower():
+                logger.debug("Skipping own bot comment for %s", display_id)
+                bucket_mod.update_ticket_thread_timeline(display_id, entry_id or "")
+                continue
+
+            # Stage-aware context header
+            stage_lower = stage_name.lower()
+            awaiting_stages = {s.lower() for s in (config.monitor.awaiting_info_stage_names or [])}
+            escalated_stages = {s.lower() for s in getattr(config.monitor, "escalated_stage_names", ["escalated to dev", "escalated to dev"])}
+
+            if stage_lower in awaiting_stages:
+                context_header = ":bell: *Got the info we needed!*"
+                next_hint = "Review the update and decide: run a skill or move to *Under Investigation*."
+            elif stage_lower in escalated_stages:
+                context_header = ":mega: *Dev team replied*"
+                next_hint = "Review and decide: close the ticket or move to *PSE Fixing*."
+            else:
+                context_header = ":memo: *Ticket update*"
+                next_hint = "Review the update below."
+
+            # Detect skill from the update
             analysis_text = f"Ticket: {title}\nStage: {stage_name}\n\nLatest update:\n{new_content[:1500]}"
-            response = reply(analysis_text, config)
-            skill_name = _parse_skill_name(response)
+            skill_name, _ = _detect_skill(analysis_text)
+            skill_name = skill_name or "none"
 
-            if len(response) > 2800:
-                response = response[:2800] + "\n… (truncated)"
-
-            from .retriever import find_relevant, format_related_ticket_links
-            relevant = find_relevant(analysis_text, config, top_k=5)
-            related_line = format_related_ticket_links(
-                relevant,
-                app_base_url=getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai",
-                max_items=5,
+            update_msg = (
+                f"{context_header} on *{display_id}* (Stage: `{stage_name}`)\n\n"
+                f"*Reporter update:*\n{new_content[:500]}\n\n"
+                f"{next_hint}\n"
+                f"Suggested skill: `{skill_name}`\n\n"
+                f"Reply *Yes* to run `{skill_name}`, or *Approve* if already handled."
             )
 
-            message_parts = [
-                "📝 *Assigned Ticket Update*",
-                f"*{display_id}* — {title[:80]} (Stage: {stage_name})",
-                "",
-                "*Latest update:*",
-                new_content[:400],
-                "",
-                "*AI Analysis:*",
-                response,
-            ]
-            if related_line:
-                message_parts.append("")
-                message_parts.append(related_line)
-            message_parts.append("")
-            message_parts.append("—_Reply **Yes** to run the skill, then **Approve** to post resolution._")
-            message_text = "\n".join(message_parts)
+            channel_id = config.slack.bucket_channel_id or os.environ.get("SLACK_BUCKET_CHANNEL_ID") or ""
 
-            _slack_post_interactive(
-                text=message_text,
-                config=config,
-                work_id=wid,
-                display_id=display_id,
-                ticket_text=analysis_text,
-                skill_name=skill_name,
-            )
+            # Look up existing Slack thread for this ticket
+            existing = bucket_mod.get_ticket_thread(display_id)
+            if existing and existing.get("thread_ts") and channel_id:
+                # Post in the EXISTING thread
+                try:
+                    from slack_sdk import WebClient
+                    client = WebClient(token=config.slack.bot_token)
+                    client.chat_postMessage(
+                        channel=existing["channel"],
+                        thread_ts=existing["thread_ts"],
+                        text=update_msg,
+                    )
+                    # Update thread state so Yes/Approve flow works
+                    bucket_mod.set_bucket_thread_state(existing["channel"], existing["thread_ts"], {
+                        "step": "suggested",
+                        "work_id": wid,
+                        "display_id": display_id,
+                        "ticket_text": analysis_text,
+                        "skill_name": skill_name,
+                    })
+                    bucket_mod.update_ticket_thread_timeline(display_id, entry_id or "")
+                    logger.info("Posted update for %s in existing thread %s", display_id, existing["thread_ts"])
+                except Exception as e:
+                    logger.warning("Could not post in existing thread for %s: %s", display_id, e)
+            else:
+                # No existing thread — post as new top-level message and save mapping
+                _slack_post_interactive(
+                    text=update_msg,
+                    config=config,
+                    work_id=wid,
+                    display_id=display_id,
+                    ticket_text=analysis_text,
+                    skill_name=skill_name,
+                )
+                logger.info("No existing thread for %s — posted as new message", display_id)
 
         except Exception as e:
             logger.exception("Analyze assigned ticket update %s: %s", wid, e)
-            # Fallback: simple notification
             _slack_post_webhook(
                 f"My ticket update: <https://app.devrev.ai|{wid}> — new reply/activity.",
                 config,

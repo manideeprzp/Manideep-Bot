@@ -599,5 +599,50 @@ def run_skill(skill_name: str, ticket_text: str, ticket_id: str = "") -> tuple[s
         except Exception as e:
             return str(e)[:500], False
 
+    # Wallet Closure — delegates to Claude Code CLI with the skill loaded
+    elif skill_name in ("wallet-closure", "wallet_closure"):
+        # Find the SKILL.md
+        skill_md = _find_skill_script(
+            "teams", "engage", "wallet", "wallet-closure", "SKILL.md"
+        )
+        if not skill_md.exists():
+            return f"wallet-closure SKILL.md not found at {skill_md}. Pull latest agent-skills.", False
+
+        # Extract ticket number from ticket_id (e.g. ISS-1922570 → 1922570)
+        tid = (ticket_id or "").strip().upper()
+        if not tid:
+            return "Ticket ID is required for wallet-closure. Please provide ISS-XXXXXXX.", False
+
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            return "claude CLI not found — wallet-closure requires Claude Code to run.", False
+
+        prompt = (
+            f"Read the wallet-closure skill at {skill_md} and follow it step-by-step "
+            f"to process wallet closure for ticket {tid}. "
+            f"Execute all steps: fetch ticket, parse description, query Redash, "
+            f"get admin token via Chrome, execute the closure curl, and comment on DevRev. "
+            f"Ticket context:\n{(ticket_text or '')[:2000]}"
+        )
+
+        try:
+            result = subprocess.run(
+                [claude_bin, "-p", prompt, "--allowedTools", "Bash,Read,Write,WebFetch,mcp__claude-in-chrome__*"],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=str(_BOT_ROOT),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()[:3000], True
+            else:
+                err = (result.stderr or result.stdout or "claude CLI failed").strip()
+                logger.warning("wallet-closure claude CLI returned %d: %s", result.returncode, err[:200])
+                return err[:3000], False
+        except subprocess.TimeoutExpired:
+            return "wallet-closure timed out (300s). The workflow may need manual intervention.", False
+        except Exception as e:
+            return f"wallet-closure error: {str(e)[:500]}", False
+
     # Unknown skill
-    return f"No runnable skill for '{skill_name}'. Available skills: order-trace-debugger, gc-redemption-report, gc-cancellation, vishnu-terraform-kong-pr, github-pr.", False
+    return f"No runnable skill for '{skill_name}'. Available skills: order-trace-debugger, gc-redemption-report, gc-cancellation, vishnu-terraform-kong-pr, github-pr, wallet-closure.", False

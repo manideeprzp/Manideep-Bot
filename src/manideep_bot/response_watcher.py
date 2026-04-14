@@ -143,6 +143,52 @@ def _post_formatted(slack_client, channel: str, thread_ts: str, ticket_id: str, 
         )
 
 
+_REQUEST_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "claude_requests"
+_NOTIFIED: set = set()
+
+
+def start_pending_notifier(slack_client, notify_channel: str, bot_user_id: str = ""):
+    """
+    Background thread: watches data/claude_requests/ for new ticket request files.
+    When new files appear, posts a batched Slack notification — user replies
+    '@ManideepBot check' in Slack to trigger analysis. No Claude Code needed.
+    """
+    def _notify():
+        _REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("Pending notifier started — watching %s", _REQUEST_DIR)
+        mention = f"<@{bot_user_id}> check" if bot_user_id else "@ManideepBot check"
+        while True:
+            try:
+                new_tickets = [
+                    f.stem for f in _REQUEST_DIR.glob("ISS-*.md")
+                    if f.stem not in _NOTIFIED
+                ]
+                if new_tickets:
+                    count = len(new_tickets)
+                    ticket_list = ", ".join(f"`{t}`" for t in new_tickets[:5])
+                    if count > 5:
+                        ticket_list += f" + {count - 5} more"
+                    msg = (
+                        f":inbox_tray: *{count} new ticket{'s' if count > 1 else ''} pending analysis*\n"
+                        f"{ticket_list}\n\n"
+                        f"Reply  *{mention}*  to analyze {'them' if count > 1 else 'it'}."
+                    )
+                    try:
+                        slack_client.chat_postMessage(channel=notify_channel, text=msg)
+                        logger.info("Notified Slack: %d pending tickets", count)
+                    except Exception as e:
+                        logger.error("Failed to post pending notification: %s", e)
+                    for t in new_tickets:
+                        _NOTIFIED.add(t)
+            except Exception as e:
+                logger.error("Pending notifier error: %s", e)
+            time.sleep(10)
+
+    t = Thread(target=_notify, daemon=True)
+    t.start()
+    return t
+
+
 def start_response_watcher(slack_client):
     """
     Background thread: watches for .md files in data/claude_responses/.

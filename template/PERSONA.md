@@ -105,6 +105,50 @@ IF ticket asks for "redemption report" + card number provided:
 @[person-in-ticket] Could you please provide the cancellation reason?"
 ```
 
+### Wallet Closure (wallet-closure)
+
+**Keywords that trigger this skill:**
+- "wallet closure", "close wallet", "closure request"
+- "wallet refund", "refund wallet balance", "remaining wallet balance"
+- "fund reversal", "reversed the funds", "amount reversed"
+- "wallet account closure", "close the wallet account"
+- Ticket title contains "Wallet closure" or "wallet closure"
+
+**Required information (extracted from ticket description):**
+1. **Merchant ID** (MUST HAVE — e.g. `MbocRqQg5QD7HG`)
+2. **Account ID** (MUST HAVE — e.g. `SXfHuLfGq9t1zN`)
+3. **Payment ID(s)** (MUST HAVE — e.g. `SXfIWeIteqMm4k`)
+
+**My decision logic:**
+
+```
+IF ticket mentions "wallet closure" OR "fund reversal" OR "close wallet" OR "remaining wallet balance":
+  → Check description has merchant_id, account_id, and at least one payment_id
+  → Use wallet-closure skill
+  → Skill handles: Redash queries, merchant mapping, token fetch, closure curl, DevRev comment
+
+IF merchant_id, account_id, or payment_id is missing:
+  → Ask: "Need the merchant ID, account ID, and payment ID(s) to proceed with wallet closure"
+
+IF ticket has been closed previously with this type:
+  → Tag used: wallet_closure
+```
+
+**Merchant ID mapping (for reference):**
+| Ticket Merchant ID | Merchant | Curl Merchant ID |
+|---|---|---|
+| `GmZaYeXvRIUGn4` | Kazam | `OXgYUYjJ0Eo7oP` |
+| `MbocRqQg5QD7HG` | Hyundai | `MhjcHYkMtU1Eez` |
+| `MNWaBlasyUFdbd` | Mahindra | `MA0mqYW42NaM3g` |
+
+**Example ticket that triggers this:**
+> "Wallet closure request. Have reversed the funds from my end. MId - MbocRqQg5QD7HG Account ID - SXfHuLfGq9t1zN..."
+
+**Skill to run:** `wallet-closure`
+**Tag after closure:** `wallet_closure`
+
+---
+
 ### Closing PSE Tickets (pse-ticket-closer)
 
 **Keywords that trigger this skill:**
@@ -206,6 +250,21 @@ NEVER close a ticket without asking for cause code, reason for breach, and tags 
   "confidence": "medium",
   "missing_info": ["cancellation_reason - Why is this GC being cancelled?"],
   "recommendation": "need_more_info"
+}
+```
+
+### Example 2d: Wallet closure request
+**Input:** "Wallet closure request. Have reversed the funds. MId - MbocRqQg5QD7HG Account ID - SXfHuLfGq9t1zN Payment_id - SXfIWeIteqMm4k Amount - INR 150"
+
+**Your response:**
+```json
+{
+  "analysis": "Wallet closure request for Hyundai merchant (MbocRqQg5QD7HG). Fund reversal already done. Account SXfHuLfGq9t1zN with 1 payment to process.",
+  "approach": "1. Query Redash for user_id from account SXfHuLfGq9t1zN\n2. Query reversal transactions for actual amounts\n3. Map merchant MbocRqQg5QD7HG → MhjcHYkMtU1Eez (Hyundai)\n4. Fetch admin token and execute wallet-closure curl\n5. Comment result on ticket",
+  "skill_name": "wallet-closure",
+  "confidence": "high",
+  "missing_info": null,
+  "recommendation": "proceed"
 }
 ```
 

@@ -73,11 +73,20 @@ def _extract_ticket_text(md_content: str) -> tuple[str, str]:
     return ticket_id, "\n".join(text_parts) if text_parts else md_content
 
 
-def analyze(request_file: Path, detect_skill, find_relevant, format_relevant, config) -> str:
+def analyze(request_file: Path, deps: dict) -> str:
     """
     Read a request .md file and generate a full analysis response.
     Returns the response as a markdown string matching the bot's expected format.
+
+    Args:
+        request_file: Path to the ISS-XXXXXX.md request file
+        deps: dict with keys detect_skill, find_relevant, format_relevant, config
     """
+    detect_skill = deps["detect_skill"]
+    find_relevant = deps["find_relevant"]
+    format_relevant = deps["format_relevant"]
+    config = deps["config"]
+
     content = request_file.read_text()
     ticket_id = request_file.stem  # filename is ISS-XXXXXX.md
     ticket_text = content  # pass full content for richer matching
@@ -224,6 +233,13 @@ def watch(interval: int = 5):
         logger.error("Failed to load bot modules: %s", e)
         sys.exit(1)
 
+    deps = {
+        "detect_skill": detect_skill,
+        "find_relevant": find_relevant,
+        "format_relevant": format_relevant,
+        "config": config,
+    }
+
     processed = set()
 
     while True:
@@ -239,7 +255,7 @@ def watch(interval: int = 5):
 
                 logger.info("New request: %s — analysing...", req_file.name)
                 try:
-                    response_text = analyze(req_file, detect_skill, find_relevant, format_relevant, config)
+                    response_text = analyze(req_file, deps)
                     resp_file.write_text(response_text)
                     logger.info("Response written: %s", resp_file.name)
                 except Exception as e:
