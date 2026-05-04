@@ -57,6 +57,12 @@ def _save_persisted_state():
         logger.warning("Could not save thread state: %s", e)
 
 
+def _set_state(key, state):
+    """Update in-memory thread state AND persist to disk immediately."""
+    _thread_state[key] = state
+    _save_persisted_state()
+
+
 # Load persisted state on startup
 _thread_state.update(_load_persisted_state())
 
@@ -606,6 +612,9 @@ def run_slack_bot():
             say(text="You are not allowed to use this bot.", thread_ts=thread_ts)
             return
 
+        # Strip Slack MCP "Sent using" footer from text before processing
+        text = re.sub(r"\s*\*[Ss]ent using\*.*$", "", text).strip()
+
         if not text:
             from .commands import get_commands_help
             say(text=get_commands_help(), thread_ts=thread_ts)
@@ -767,8 +776,7 @@ def run_slack_bot():
                         "channel": ch,
                         "thread_ts": thread_ts,
                     }
-                    _thread_state[key] = state
-                    _save_persisted_state()
+                    _set_state(key, state)
                     is_bucket = False
                     logger.info("Recovered state from thread history: skill=%s display_id=%s", recovered_skill, recovered_display_id)
             except Exception as _re:
@@ -894,7 +902,7 @@ def run_slack_bot():
                 if is_bucket:
                     bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
                 else:
-                    _thread_state[key] = state
+                    _set_state(key, state)
                 say(text=f":warning: {out}", thread_ts=thread_ts)
                 return
             say(
@@ -907,7 +915,7 @@ def run_slack_bot():
             if is_bucket:
                 bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
             else:
-                _thread_state[key] = state
+                _set_state(key, state)
             return
 
         logger.info("[MSG] cmd=%r step=%r is_bucket=%s", cmd, state.get("step"), is_bucket)
@@ -952,7 +960,7 @@ def run_slack_bot():
                 if is_bucket:
                     bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
                 else:
-                    _thread_state[key] = state
+                    _set_state(key, state)
                 say(text=f":warning: {out}", thread_ts=thread_ts)
                 return
             say(
@@ -965,7 +973,7 @@ def run_slack_bot():
             if is_bucket:
                 bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
             else:
-                _thread_state[key] = state
+                _set_state(key, state)
             return
 
         if state.get("step") == "pending_approve" and not state.get("work_id"):
@@ -976,7 +984,7 @@ def run_slack_bot():
                 if is_bucket:
                     bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
                 else:
-                    _thread_state[key] = state
+                    _set_state(key, state)
                 say(text=f"Got ticket ID: {wid}. Reply **Approve** to post the resolution and close it.", thread_ts=thread_ts)
                 return
 
@@ -1016,7 +1024,7 @@ def run_slack_bot():
             if is_bucket:
                 bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
             else:
-                _thread_state[key] = state
+                _set_state(key, state)
             return
 
         # ── PSE ticket closer step: run close_pse_ticket.py ────────────────
@@ -1130,7 +1138,7 @@ def run_slack_bot():
                 if is_bucket:
                     bucket_mod.set_bucket_thread_state(ch, thread_ts, state)
                 else:
-                    _thread_state[key] = state
+                    _set_state(key, state)
                 return
 
             if raw_text not in ("confirm", "yes", "ok", "done", "close it", "proceed"):
@@ -1410,8 +1418,9 @@ def run_slack_bot():
     def _catchup_scan():
         """
         Runs once on startup (in background thread, after 8s delay for connection).
-        Fetches unassigned PSE tickets in triage stage from the last 24 hours
-        that the bot may have missed while it was down, and processes each one.
+        Two phases:
+          1. Fetch unassigned PSE tickets missed while bot was down → auto-assign + thread
+          2. Fetch assigned tickets with no Slack thread yet → create threads
         """
         import time as _time
         _time.sleep(8)  # wait for Slack connection to stabilise
@@ -1420,110 +1429,183 @@ def run_slack_bot():
             logger.warning("Catch-up scan: bucket_channel_id not set, skipping")
             return
 
-        logger.info("🔍 Catch-up scan: checking for missed unassigned tickets...")
+        logger.info("🔍 Catch-up scan: Phase 1 — checking for missed unassigned tickets...")
         try:
             from . import devrev_client
             from .monitor import _fetch_new_tickets
             from .response_watcher import _post_formatted
             from . import bucket as bucket_mod
             from .enhanced_agent import detect_skill as _detect_skill
+            from .scripts_utils import build_inline_analysis
 
+            # ── Phase 1: Unassigned tickets ──────────────────────────────────
             tickets = _fetch_new_tickets(config)
-            if not tickets:
-                logger.info("Catch-up scan: no unassigned tickets found")
+            unassigned_count = 0
+            if tickets:
+                logger.info("Catch-up scan: found %d unassigned ticket(s) to process", len(tickets))
                 app.client.chat_postMessage(
                     channel=bucket_ch,
-                    text="✅ *Catch-up scan complete* — no missed unassigned tickets found.",
+                    text=f"🔍 *Catch-up scan* — found *{len(tickets)}* unassigned ticket(s) missed while bot was down. Processing now...",
                 )
-                return
 
-            logger.info("Catch-up scan: found %d unassigned ticket(s) to process", len(tickets))
-            app.client.chat_postMessage(
-                channel=bucket_ch,
-                text=f"🔍 *Catch-up scan* — found *{len(tickets)}* unassigned ticket(s) missed while bot was down. Processing now...",
-            )
+                for w in tickets[:15]:
+                    work_id = w.get("id", "")
+                    display_id = w.get("display_id") or work_id
+                    title = (w.get("title") or "")[:200]
+                    body = (w.get("body") or "")[:3000]
+                    ticket_text = f"{title}\n\n{body}".strip() or str(display_id)
 
-            for w in tickets[:15]:  # cap at 15 to avoid spam
-                work_id = w.get("id", "")
-                display_id = w.get("display_id") or work_id
-                title = (w.get("title") or "")[:200]
-                body = (w.get("body") or "")[:3000]
-                ticket_text = f"{title}\n\n{body}".strip() or str(display_id)
+                    try:
+                        assigned_now = False
+                        if my_user_id and _is_unassigned(w, svcacc_id):
+                            try:
+                                current_count = devrev_client.count_open_tickets_for_user(my_user_id)
+                                if current_count < 15:
+                                    devrev_client.work_assign(work_id, my_user_id)
+                                    assigned_now = True
+                                    logger.info("Catch-up: auto-assigned %s", display_id)
+                            except Exception as e:
+                                logger.warning("Catch-up auto-assign failed for %s: %s", display_id, e)
 
-                try:
-                    # Auto-assign if unassigned
-                    assigned_now = False
-                    if my_user_id and _is_unassigned(w, svcacc_id):
-                        try:
-                            current_count = devrev_client.count_open_tickets_for_user(my_user_id)
-                            if current_count < 15:
-                                devrev_client.work_assign(work_id, my_user_id)
-                                assigned_now = True
-                                logger.info("Catch-up: auto-assigned %s", display_id)
-                        except Exception as e:
-                            logger.warning("Catch-up auto-assign failed for %s: %s", display_id, e)
+                        app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
+                        ticket_url = f"{app_base}/razorpay/issue/{display_id}"
+                        status_line = "✅ Auto-assigned to you (catch-up)" if assigned_now else "_(already assigned)_"
 
-                    # Post ticket notification
-                    app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
-                    ticket_url = f"{app_base}/razorpay/issue/{display_id}"
-                    status_line = "✅ Auto-assigned to you (catch-up)" if assigned_now else "_(already assigned)_"
+                        notify_result = app.client.chat_postMessage(
+                            channel=bucket_ch,
+                            text=f"[Catch-up] {display_id} — {title[:80]}",
+                            attachments=[{
+                                "color": "#FF8C00",
+                                "title": f"[Catch-up] {display_id} — {title[:80]}",
+                                "title_link": ticket_url,
+                                "text": status_line,
+                                "footer": "DevRev · PSE · Missed while bot was down",
+                            }],
+                        )
+                        posted_ts = notify_result["ts"]
+                        bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
 
-                    notify_result = app.client.chat_postMessage(
-                        channel=bucket_ch,
-                        text=f"[Catch-up] {display_id} — {title[:80]}",
-                        attachments=[{
-                            "color": "#FF8C00",  # orange = catch-up (vs blue = live)
-                            "title": f"[Catch-up] {display_id} — {title[:80]}",
-                            "title_link": ticket_url,
-                            "text": status_line,
-                            "footer": "DevRev · PSE · Missed while bot was down",
-                        }],
+                        skill_name, confidence = _detect_skill(ticket_text)
+                        skill_name = skill_name or "none"
+
+                        response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
+                        _post_formatted(app.client, bucket_ch, posted_ts, display_id, response)
+
+                        if skill_name in _AUTO_RUN_SKILLS:
+                            app.client.chat_postMessage(
+                                channel=bucket_ch, thread_ts=posted_ts,
+                                text=f":robot_face: *Auto-running* `{skill_name}`...",
+                            )
+                            from . import skill_runner
+                            out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=display_id)
+                            result_text = (
+                                f":white_check_mark: `{skill_name}` done.\n```\n{out[:2500]}\n```\n\nReply *Approve* to post and close."
+                                if ok else
+                                f":warning: Auto-run failed: {out}\n\nReply *Yes* after adding missing info."
+                            )
+                            app.client.chat_postMessage(channel=bucket_ch, thread_ts=posted_ts, text=result_text)
+                            step = "pending_approve" if ok else "suggested"
+                        else:
+                            step = "suggested"
+
+                        bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                            "step": step, "work_id": work_id, "display_id": display_id,
+                            "ticket_text": ticket_text, "skill_name": skill_name,
+                        })
+                        unassigned_count += 1
+
+                    except Exception as e:
+                        logger.exception("Catch-up: error processing %s: %s", display_id, e)
+            else:
+                logger.info("Catch-up scan: no unassigned tickets found")
+
+            # ── Phase 2: Assigned tickets with no Slack thread ───────────────
+            logger.info("🔍 Catch-up scan: Phase 2 — checking assigned tickets with no thread...")
+            assigned_count = 0
+            try:
+                user_id = my_user_id
+                if not user_id:
+                    logger.info("Catch-up Phase 2: my_user_id not set, skipping")
+                else:
+                    data = devrev_client.works_list(
+                        owned_by=[user_id],
+                        state=config.monitor.my_tickets_states,
+                        limit=30,
                     )
-                    posted_ts = notify_result["ts"]
+                    assigned_works = data.get("works") or []
 
-                    # Save ticket → Slack thread mapping for monitor continuity
-                    from . import bucket as _bucket_mod_cu
-                    _bucket_mod_cu.save_ticket_thread(display_id, bucket_ch, posted_ts)
+                    no_thread = [
+                        w for w in assigned_works
+                        if not bucket_mod.get_ticket_thread(w.get("display_id") or "")
+                    ]
 
-                    # Detect skill + post analysis
-                    skill_name, confidence = _detect_skill(ticket_text)
-                    skill_name = skill_name or "none"
-
-                    from .scripts_utils import build_inline_analysis
-                    response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
-                    _post_formatted(app.client, bucket_ch, posted_ts, display_id, response)
-
-                    # Auto-run safe skills
-                    if skill_name in _AUTO_RUN_SKILLS:
+                    if no_thread:
+                        logger.info("Catch-up Phase 2: %d assigned ticket(s) with no thread", len(no_thread))
                         app.client.chat_postMessage(
                             channel=bucket_ch,
-                            thread_ts=posted_ts,
-                            text=f":robot_face: *Auto-running* `{skill_name}`...",
+                            text=f":file_folder: *Catch-up* — found *{len(no_thread)}* assigned ticket(s) with no thread. Creating now...",
                         )
-                        from . import skill_runner
-                        out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=display_id)
-                        result_text = (
-                            f":white_check_mark: `{skill_name}` done.\n```\n{out[:2500]}\n```\n\nReply *Approve* to post and close."
-                            if ok else
-                            f":warning: Auto-run failed: {out}\n\nReply *Yes* after adding missing info."
-                        )
-                        app.client.chat_postMessage(channel=bucket_ch, thread_ts=posted_ts, text=result_text)
-                        step = "pending_approve" if ok else "suggested"
+
+                        app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
+                        for w in no_thread[:15]:
+                            display_id = w.get("display_id") or w.get("id", "")
+                            title = (w.get("title") or "")[:100]
+                            body = (w.get("body") or "")[:2000]
+                            stage_name = (w.get("stage") or {}).get("name") or "Unknown"
+                            ticket_text = f"{title}\n\n{body}".strip()
+
+                            try:
+                                skill_name, confidence = _detect_skill(ticket_text)
+                                skill_name = skill_name or "none"
+
+                                ticket_url = f"{app_base}/razorpay/issue/{display_id}"
+                                post_result = app.client.chat_postMessage(
+                                    channel=bucket_ch,
+                                    text=f"{display_id} — {title}",
+                                    attachments=[{
+                                        "color": "#6B47DC",
+                                        "title": f"{display_id} — {title}",
+                                        "title_link": ticket_url,
+                                        "text": f"Stage: `{stage_name}` | Assigned to you",
+                                        "footer": "DevRev · PSE · My Tickets",
+                                    }],
+                                )
+                                posted_ts = post_result["ts"]
+
+                                response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
+                                _post_formatted(app.client, bucket_ch, posted_ts, display_id, response)
+
+                                bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
+                                bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                                    "step": "suggested",
+                                    "work_id": w.get("id", ""),
+                                    "display_id": display_id,
+                                    "ticket_text": ticket_text,
+                                    "skill_name": skill_name,
+                                })
+                                assigned_count += 1
+                                logger.info("Catch-up Phase 2: created thread for %s", display_id)
+                            except Exception as e:
+                                logger.exception("Catch-up Phase 2: failed for %s: %s", display_id, e)
                     else:
-                        step = "suggested"
+                        logger.info("Catch-up Phase 2: all assigned tickets already have threads")
 
-                    bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
-                        "step": step,
-                        "work_id": work_id,
-                        "display_id": display_id,
-                        "ticket_text": ticket_text,
-                        "skill_name": skill_name,
-                    })
+            except Exception as e:
+                logger.exception("Catch-up Phase 2 failed: %s", e)
 
-                except Exception as e:
-                    logger.exception("Catch-up: error processing %s: %s", display_id, e)
-
-            logger.info("Catch-up scan complete — processed %d ticket(s)", len(tickets))
+            # ── Summary ──────────────────────────────────────────────────────
+            total = unassigned_count + assigned_count
+            if total == 0:
+                app.client.chat_postMessage(
+                    channel=bucket_ch,
+                    text="✅ *Catch-up scan complete* — all tickets have threads, no missed unassigned tickets.",
+                )
+            else:
+                app.client.chat_postMessage(
+                    channel=bucket_ch,
+                    text=f"✅ *Catch-up scan complete* — processed {unassigned_count} unassigned + {assigned_count} assigned ticket(s).",
+                )
+            logger.info("Catch-up scan complete — %d unassigned + %d assigned", unassigned_count, assigned_count)
 
         except Exception as e:
             logger.exception("Catch-up scan failed: %s", e)
