@@ -49,11 +49,9 @@ _ORDER_TRACE_CURSOR = _find_skill_script(
     "order-trace-debugger", "scripts", "trace_order.py"
 )
 
-# gc-redemption-report: not yet in agent-skills → falls back to ~/.cursor/skills on Mac
-# TODO: once merged to agent-skills, update path to:
-#   "teams", "engage", "rewards-market-place", "gc-redemption-report", "scripts", "redemption_report.py"
+# gc-redemption-report: in agent-skills repo ✅ (PR #814 merged)
 _GC_REDEMPTION_SCRIPT = _find_skill_script(
-    "gc-redemption-report", "scripts", "redemption_report.py"
+    "teams", "engage", "wallet", "gc-redemption-report", "scripts", "redemption_report.py"
 )
 
 # gc-cancellation: not yet in agent-skills → falls back to ~/.cursor/skills on Mac
@@ -98,6 +96,7 @@ def _find_order_id(text: str) -> str:
     """Extract order_id from ticket body/title (e.g. order_123 or order-id: xyz)."""
     if not text:
         return ""
+    text = text.split("\n---")[0]
     # Common patterns (checked in priority order)
     for pat in [
         r"order[_\s-]?id[\s:=]+([A-Za-z0-9_-]+)",
@@ -116,6 +115,7 @@ def _find_all_order_ids(text: str) -> list:
     """Extract all RMP-style order IDs from ticket body (e.g. SWFPzY3olAMzPl)."""
     if not text:
         return []
+    text = text.split("\n---")[0]
     # Named patterns first
     ids = re.findall(r"order[_\s-]?id[\s:=]+([A-Za-z0-9_-]+)", text, re.I)
     if ids:
@@ -133,9 +133,11 @@ def _find_card_number(text: str) -> str:
     Extract GC card number from ticket body.
     Ticket body from DevRev will have a clear line like 'Card number: 7717386747'.
     That's the source of truth — read it directly, no guessing.
+    Only scans the issue body — stops at '---' so similar-ticket card numbers are excluded.
     """
     if not text:
         return ""
+    text = text.split("\n---")[0]
     # Primary: explicit "Card number: XXXX" line (how tickets are written)
     m = re.search(r"card[_\s-]?number[\s:=]+([A-Za-z0-9]+)", text, re.I)
     if m:
@@ -159,9 +161,13 @@ def _find_all_card_numbers(text: str) -> list:
     """
     Extract ALL GC card numbers from ticket body (handles multi-card tickets).
     Returns a deduplicated list preserving order.
+    Only scans the issue body — stops at the first '---' separator so similar-ticket
+    card numbers (in the context section) are not included.
     """
     if not text:
         return []
+    # Only look in the actual issue body, not the "Similar Tickets" section
+    text = text.split("\n---")[0]
     seen = set()
     results = []
 
@@ -180,8 +186,8 @@ def _find_all_card_numbers(text: str) -> list:
     # 2-letter + 9+ digit codes
     for m in re.finditer(r"\b([A-Z]{2}[0-9]{9,})\b", text, re.I):
         _add(m.group(1))
-    # Bare 10–19 digit numeric codes (one per line)
-    for m in re.finditer(r"(?:^|\s)([0-9]{10,19})(?:\s|$)", text):
+    # Bare 10–19 digit numeric codes — handles plain text, HTML tables, and CSV
+    for m in re.finditer(r"(?<![0-9])([0-9]{10,19})(?![0-9])", text):
         _add(m.group(1))
 
     return results
@@ -399,6 +405,35 @@ def run_skill(skill_name: str, ticket_text: str, ticket_id: str = "") -> tuple[s
     elif skill_name in ("gc-redemption-report", "redemption-report", "redemption_report"):
         # Collect ALL card numbers from the ticket (handles multi-card tickets)
         card_numbers = _find_all_card_numbers(ticket_text)
+        if not card_numbers and ticket_id:
+            # ticket_text may be empty for manually submitted tickets — fetch from DevRev
+            logger.info("ticket_text empty for %s, fetching body from DevRev", ticket_id)
+            try:
+                import os, json, subprocess as _sp
+                env_file = _BOT_ROOT / "scripts" / ".env"
+                env = os.environ.copy()
+                if env_file.exists():
+                    for line in env_file.read_text().splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            env[k.strip()] = v.strip()
+                api_key = env.get("DEVREV_API_KEY", "")
+                num = ticket_id.replace("ISS-", "")
+                work_id = f"don:core:dvrv-in-1:devo/2sRI6Hepzz:issue/{num}"
+                r = _sp.run(
+                    ["curl", "-s", "-X", "POST", "https://api.devrev.ai/works.get",
+                     "-H", f"Authorization: {api_key}",
+                     "-H", "Content-Type: application/json",
+                     "-d", json.dumps({"id": work_id})],
+                    capture_output=True, text=True, timeout=15, env=env
+                )
+                body = json.loads(r.stdout).get("work", {}).get("body", "")
+                if body:
+                    card_numbers = _find_all_card_numbers(body)
+                    logger.info("Fetched DevRev body for %s, found cards: %s", ticket_id, card_numbers)
+            except Exception as _fe:
+                logger.warning("Failed to fetch DevRev ticket body for %s: %s", ticket_id, _fe)
         if not card_numbers:
             return (
                 "Card number not found in the ticket body.\n"

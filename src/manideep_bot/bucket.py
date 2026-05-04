@@ -3,9 +3,11 @@ Bucket watcher: fetch tickets assigned to you from DevRev, analyze each (retriev
 post suggestions to Slack. You reply Done → bot runs skill; Approve → post on DevRev and close.
 No pasting: bot watches your bucket only.
 """
+import hashlib
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 from .config import Config
@@ -86,13 +88,28 @@ def _save_ticket_threads(data: dict):
         json.dump(data, f, indent=2)
 
 
-def save_ticket_thread(display_id: str, channel: str, thread_ts: str, last_timeline_id: str = ""):
+def get_body_hash(title: str, body: str) -> str:
+    """MD5 hash of title+body for change detection."""
+    return hashlib.md5((title + body).encode()).hexdigest()
+
+
+def save_ticket_thread(
+    display_id: str,
+    channel: str,
+    thread_ts: str,
+    last_timeline_id: str = "",
+    last_body_hash: str = "",
+    last_status_update_ts: float = 0.0,
+):
     """Save the Slack thread for a ticket so monitor updates reply there."""
     data = _load_ticket_threads()
+    existing = data.get(display_id, {})
     data[display_id] = {
         "channel": channel,
         "thread_ts": thread_ts,
-        "last_timeline_id": last_timeline_id,
+        "last_timeline_id": last_timeline_id or existing.get("last_timeline_id", ""),
+        "last_body_hash": last_body_hash or existing.get("last_body_hash", ""),
+        "last_status_update_ts": last_status_update_ts or existing.get("last_status_update_ts", 0.0),
     }
     _save_ticket_threads(data)
 
@@ -107,6 +124,14 @@ def update_ticket_thread_timeline(display_id: str, last_timeline_id: str):
     data = _load_ticket_threads()
     if display_id in data:
         data[display_id]["last_timeline_id"] = last_timeline_id
+        _save_ticket_threads(data)
+
+
+def update_ticket_thread_fields(display_id: str, **kwargs):
+    """Update arbitrary fields on a ticket thread record (e.g. last_body_hash, last_status_update_ts)."""
+    data = _load_ticket_threads()
+    if display_id in data:
+        data[display_id].update(kwargs)
         _save_ticket_threads(data)
 
 

@@ -336,6 +336,124 @@ def _get_analysis(ticket_text: str, config, ticket_id: str = None, channel: str 
         return claude_code_reply(ticket_text, config, ticket_id, channel, thread_ts)
 
 
+_STATUS_UPDATE_COOLDOWN = 4 * 3600  # 4 hours in seconds
+
+
+def _update_existing_threads(has_thread_works: list, slack_client, bucket_ch: str, config):
+    """
+    For assigned tickets that ALREADY have a Slack thread:
+      - If ticket body changed → re-detect skill, post re-analysis
+      - Else → post status update (stage, age, SLA) if >4h since last
+    Returns count of tickets updated.
+    """
+    from . import bucket as bucket_mod
+    from .enhanced_agent import detect_skill as _detect_skill
+    from .scripts_utils import build_inline_analysis
+    from .response_watcher import _post_formatted
+    import time as _time
+    from datetime import datetime, timezone
+
+    updated = 0
+    now = _time.time()
+
+    for w in has_thread_works:
+        display_id = w.get("display_id") or w.get("id", "")
+        thread_info = bucket_mod.get_ticket_thread(display_id)
+        if not thread_info:
+            continue
+
+        channel = thread_info.get("channel", bucket_ch)
+        thread_ts = thread_info.get("thread_ts", "")
+        stored_hash = thread_info.get("last_body_hash", "")
+        last_status_ts = thread_info.get("last_status_update_ts", 0.0)
+
+        title = (w.get("title") or "")[:200]
+        body = (w.get("body") or "")[:3000]
+        current_hash = bucket_mod.get_body_hash(title, body)
+        ticket_text = f"{title}\n\n{body}".strip()
+
+        try:
+            if stored_hash and current_hash != stored_hash:
+                # ── Body changed → re-analyze ──────────────────────────────
+                skill_name, confidence = _detect_skill(ticket_text)
+                skill_name = skill_name or "none"
+
+                slack_client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=":arrows_counterclockwise: *Ticket updated* — re-analyzing with new content...",
+                )
+
+                response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
+                _post_formatted(slack_client, channel, thread_ts, display_id, response)
+
+                # Update bucket thread state with new skill
+                bucket_mod.set_bucket_thread_state(channel, thread_ts, {
+                    "step": "suggested",
+                    "work_id": w.get("id", ""),
+                    "display_id": display_id,
+                    "ticket_text": ticket_text,
+                    "skill_name": skill_name,
+                })
+                bucket_mod.update_ticket_thread_fields(
+                    display_id,
+                    last_body_hash=current_hash,
+                    last_status_update_ts=now,
+                )
+                updated += 1
+                logger.info("Re-analyzed %s (body changed)", display_id)
+
+            elif (now - last_status_ts) > _STATUS_UPDATE_COOLDOWN:
+                # ── No body change, cooldown passed → status update ────────
+                stage_name = (w.get("stage") or {}).get("name") or "Unknown"
+                priority = "P" + str((w.get("priority_v2") or {}).get("id", "?"))
+                if priority == "P?":
+                    priority = "Unknown"
+
+                # Compute age
+                created_date = w.get("created_date") or ""
+                if created_date:
+                    try:
+                        created_dt = datetime.fromisoformat(created_date.replace("Z", "+00:00"))
+                        age_days = (datetime.now(timezone.utc) - created_dt).days
+                        age_str = f"{age_days}d"
+                    except Exception:
+                        age_str = "?"
+                else:
+                    age_str = "?"
+
+                # SLA
+                sla_summary = w.get("sla_summary") or {}
+                sla_stage = sla_summary.get("stage") or "unknown"
+
+                slack_client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        f":bar_chart: *Status update* — `{display_id}`\n"
+                        f"Stage: `{stage_name}` | Age: {age_str} | "
+                        f"SLA: `{sla_stage}` | Priority: `{priority}`"
+                    ),
+                )
+                bucket_mod.update_ticket_thread_fields(
+                    display_id,
+                    last_body_hash=current_hash,
+                    last_status_update_ts=now,
+                )
+                updated += 1
+                logger.info("Status update for %s (stage=%s)", display_id, stage_name)
+            else:
+                # Update hash silently (first time or no change + cooldown not passed)
+                if not stored_hash:
+                    bucket_mod.update_ticket_thread_fields(display_id, last_body_hash=current_hash)
+                logger.debug("Skipped %s — no change, cooldown not passed", display_id)
+
+        except Exception as e:
+            logger.error("Failed to update thread for %s: %s", display_id, e)
+
+    return updated
+
+
 def _handle_check(event: dict, say, config, slack_client=None):
     """
     Handle '@bot check' from Slack — two actions:
@@ -437,58 +555,77 @@ def _handle_check(event: dict, say, config, slack_client=None):
             w for w in assigned_works
             if not bucket_mod.get_ticket_thread(w.get("display_id") or "")
         ]
+        has_thread = [
+            w for w in assigned_works
+            if bucket_mod.get_ticket_thread(w.get("display_id") or "")
+        ]
 
-        if not no_thread:
+        if not no_thread and not has_thread:
             if not pending:
-                say(text=":white_check_mark: All caught up — no pending tickets and all assigned tickets have threads.", thread_ts=thread_ts)
+                say(text=":white_check_mark: All caught up — no pending tickets and no assigned tickets.", thread_ts=thread_ts)
             return
 
-        say(
-            text=f":file_folder: Found *{len(no_thread)}* assigned ticket{'s' if len(no_thread) > 1 else ''} with no thread — creating now...",
-            thread_ts=thread_ts,
-        )
+        # ── Part 2a: Create threads for tickets without one ────────────────
+        if no_thread:
+            say(
+                text=f":file_folder: Found *{len(no_thread)}* assigned ticket{'s' if len(no_thread) > 1 else ''} with no thread — creating now...",
+                thread_ts=thread_ts,
+            )
 
-        app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
-        for w in no_thread[:10]:
-            display_id = w.get("display_id") or w.get("id", "")
-            title = (w.get("title") or "")[:100]
-            body = (w.get("body") or "")[:2000]
-            stage_name = (w.get("stage") or {}).get("name") or "Unknown"
-            ticket_text = f"{title}\n\n{body}".strip()
+            app_base = getattr(config.devrev, "app_base_url", None) or "https://app.devrev.ai"
+            for w in no_thread[:10]:
+                display_id = w.get("display_id") or w.get("id", "")
+                title = (w.get("title") or "")[:100]
+                body = (w.get("body") or "")[:2000]
+                stage_name = (w.get("stage") or {}).get("name") or "Unknown"
+                ticket_text = f"{title}\n\n{body}".strip()
 
-            try:
-                skill_name, confidence = _detect_skill(ticket_text)
-                skill_name = skill_name or "none"
+                try:
+                    skill_name, confidence = _detect_skill(ticket_text)
+                    skill_name = skill_name or "none"
 
-                ticket_url = f"{app_base}/razorpay/issue/{display_id}"
-                post_result = slack_client.chat_postMessage(
-                    channel=bucket_ch,
-                    text=f"{display_id} — {title}",
-                    attachments=[{
-                        "color": "#6B47DC",
-                        "title": f"{display_id} — {title}",
-                        "title_link": ticket_url,
-                        "text": f"Stage: `{stage_name}` | Assigned to you",
-                        "footer": "DevRev · PSE · My Tickets",
-                    }],
+                    ticket_url = f"{app_base}/razorpay/issue/{display_id}"
+                    post_result = slack_client.chat_postMessage(
+                        channel=bucket_ch,
+                        text=f"{display_id} — {title}",
+                        attachments=[{
+                            "color": "#6B47DC",
+                            "title": f"{display_id} — {title}",
+                            "title_link": ticket_url,
+                            "text": f"Stage: `{stage_name}` | Assigned to you",
+                            "footer": "DevRev · PSE · My Tickets",
+                        }],
+                    )
+                    posted_ts = post_result["ts"]
+
+                    from .scripts_utils import build_inline_analysis
+                    response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
+                    _post_formatted(slack_client, bucket_ch, posted_ts, display_id, response)
+
+                    body_hash = bucket_mod.get_body_hash(title, body)
+                    bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts, last_body_hash=body_hash)
+                    bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
+                        "step": "suggested",
+                        "work_id": w.get("id", ""),
+                        "display_id": display_id,
+                        "ticket_text": ticket_text,
+                        "skill_name": skill_name,
+                    })
+                    logger.info("check: created thread for assigned ticket %s", display_id)
+                except Exception as e:
+                    logger.error("check: failed to create thread for %s: %s", display_id, e)
+
+        # ── Part 2b: Update existing threads (status or re-analyze) ────────
+        if has_thread:
+            updated_count = _update_existing_threads(has_thread, slack_client, bucket_ch, config)
+            if updated_count:
+                say(
+                    text=f":arrows_counterclockwise: Updated *{updated_count}* existing thread{'s' if updated_count > 1 else ''}.",
+                    thread_ts=thread_ts,
                 )
-                posted_ts = post_result["ts"]
 
-                from .scripts_utils import build_inline_analysis
-                response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
-                _post_formatted(slack_client, bucket_ch, posted_ts, display_id, response)
-
-                bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
-                bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
-                    "step": "suggested",
-                    "work_id": w.get("id", ""),
-                    "display_id": display_id,
-                    "ticket_text": ticket_text,
-                    "skill_name": skill_name,
-                })
-                logger.info("check: created thread for assigned ticket %s", display_id)
-            except Exception as e:
-                logger.error("check: failed to create thread for %s: %s", display_id, e)
+        if not no_thread and not has_thread and not pending:
+            say(text=":white_check_mark: All caught up — no pending tickets.", thread_ts=thread_ts)
 
     except Exception as e:
         logger.error("check: assigned ticket scan failed: %s", e)
@@ -637,6 +774,14 @@ def run_slack_bot():
         # ── Check command: @bot check — process all pending tickets now ────────
         if text.lower().strip() in ("check", "check pending", "process"):
             _handle_check(event, say, config, slack_client=client)
+            return
+
+        # ── If "@bot yes/approve" in a thread, delegate to handle_message ────
+        # Users often type "@bot yes" instead of just "yes" in a thread reply.
+        _mention_cmd = _normalize_approve(text)
+        if _mention_cmd and event.get("thread_ts"):
+            logger.info("Mention '%s' in thread — delegating to handle_message", _mention_cmd)
+            handle_message(event, say, client)
             return
 
         say(text=":hourglass_flowing_sand: Analysing...", thread_ts=thread_ts)
@@ -952,6 +1097,29 @@ def run_slack_bot():
                     from .enhanced_agent import detect_skill as _detect_skill
                     _sk, _ = _detect_skill(ticket_text)
                     skill_name = _sk or "none"
+
+            # If ticket_text is empty/short, fetch from DevRev before running skill
+            display_id = state.get("display_id") or ""
+            if len(ticket_text) < 50 and display_id:
+                try:
+                    from . import devrev_client as _dc
+                    _work = _dc.get_work_by_display_id(display_id)
+                    if _work:
+                        _title = (_work.get("title") or "")
+                        _body = (_work.get("body") or "")[:3000]
+                        ticket_text = f"{_title}\n\n{_body}".strip()
+                        state["ticket_text"] = ticket_text
+                        logger.info("Fetched ticket body for %s (was empty)", display_id)
+                        # Re-detect skill with actual body
+                        if not skill_name or skill_name == "none":
+                            from .enhanced_agent import detect_skill as _detect_skill2
+                            _sk2, _ = _detect_skill2(ticket_text)
+                            if _sk2 and _sk2 != "none":
+                                skill_name = _sk2
+                                state["skill_name"] = skill_name
+                                logger.info("Re-detected skill from fetched body: %s", skill_name)
+                except Exception as _fe:
+                    logger.warning("Could not fetch ticket body for %s: %s", display_id, _fe)
 
             out, ok = skill_runner.run_skill(skill_name, ticket_text, ticket_id=state.get("display_id", ""))
             if not ok:
@@ -1310,7 +1478,8 @@ def run_slack_bot():
 
             # Save ticket → Slack thread mapping for monitor continuity
             from . import bucket as _bucket_mod
-            _bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
+            body_hash = _bucket_mod.get_body_hash(title, body)
+            _bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts, last_body_hash=body_hash)
 
             # 2. Get analysis
             result = _get_analysis(ticket_text, config, display_id)
@@ -1483,7 +1652,8 @@ def run_slack_bot():
                             }],
                         )
                         posted_ts = notify_result["ts"]
-                        bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
+                        body_hash = bucket_mod.get_body_hash(title, body)
+                        bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts, last_body_hash=body_hash)
 
                         skill_name, confidence = _detect_skill(ticket_text)
                         skill_name = skill_name or "none"
@@ -1519,9 +1689,10 @@ def run_slack_bot():
             else:
                 logger.info("Catch-up scan: no unassigned tickets found")
 
-            # ── Phase 2: Assigned tickets with no Slack thread ───────────────
-            logger.info("🔍 Catch-up scan: Phase 2 — checking assigned tickets with no thread...")
+            # ── Phase 2: Assigned tickets — new threads + update existing ────
+            logger.info("🔍 Catch-up scan: Phase 2 — checking assigned tickets...")
             assigned_count = 0
+            existing_updated = 0
             try:
                 user_id = my_user_id
                 if not user_id:
@@ -1538,9 +1709,14 @@ def run_slack_bot():
                         w for w in assigned_works
                         if not bucket_mod.get_ticket_thread(w.get("display_id") or "")
                     ]
+                    has_thread = [
+                        w for w in assigned_works
+                        if bucket_mod.get_ticket_thread(w.get("display_id") or "")
+                    ]
 
+                    # Phase 2a: Create threads for tickets without one
                     if no_thread:
-                        logger.info("Catch-up Phase 2: %d assigned ticket(s) with no thread", len(no_thread))
+                        logger.info("Catch-up Phase 2a: %d assigned ticket(s) with no thread", len(no_thread))
                         app.client.chat_postMessage(
                             channel=bucket_ch,
                             text=f":file_folder: *Catch-up* — found *{len(no_thread)}* assigned ticket(s) with no thread. Creating now...",
@@ -1575,7 +1751,8 @@ def run_slack_bot():
                                 response = build_inline_analysis(ticket_text, display_id, skill_name, confidence)
                                 _post_formatted(app.client, bucket_ch, posted_ts, display_id, response)
 
-                                bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts)
+                                body_hash = bucket_mod.get_body_hash(title, body)
+                                bucket_mod.save_ticket_thread(display_id, bucket_ch, posted_ts, last_body_hash=body_hash)
                                 bucket_mod.set_bucket_thread_state(bucket_ch, posted_ts, {
                                     "step": "suggested",
                                     "work_id": w.get("id", ""),
@@ -1584,28 +1761,42 @@ def run_slack_bot():
                                     "skill_name": skill_name,
                                 })
                                 assigned_count += 1
-                                logger.info("Catch-up Phase 2: created thread for %s", display_id)
+                                logger.info("Catch-up Phase 2a: created thread for %s", display_id)
                             except Exception as e:
-                                logger.exception("Catch-up Phase 2: failed for %s: %s", display_id, e)
+                                logger.exception("Catch-up Phase 2a: failed for %s: %s", display_id, e)
                     else:
-                        logger.info("Catch-up Phase 2: all assigned tickets already have threads")
+                        logger.info("Catch-up Phase 2a: all assigned tickets already have threads")
+
+                    # Phase 2b: Update existing threads (status or re-analyze)
+                    if has_thread:
+                        logger.info("Catch-up Phase 2b: updating %d existing thread(s)", len(has_thread))
+                        existing_updated = _update_existing_threads(has_thread, app.client, bucket_ch, config)
+                        if existing_updated:
+                            logger.info("Catch-up Phase 2b: updated %d thread(s)", existing_updated)
 
             except Exception as e:
                 logger.exception("Catch-up Phase 2 failed: %s", e)
 
             # ── Summary ──────────────────────────────────────────────────────
-            total = unassigned_count + assigned_count
+            total = unassigned_count + assigned_count + existing_updated
             if total == 0:
                 app.client.chat_postMessage(
                     channel=bucket_ch,
-                    text="✅ *Catch-up scan complete* — all tickets have threads, no missed unassigned tickets.",
+                    text="✅ *Catch-up scan complete* — all tickets up to date.",
                 )
             else:
+                parts = []
+                if unassigned_count:
+                    parts.append(f"{unassigned_count} unassigned")
+                if assigned_count:
+                    parts.append(f"{assigned_count} new threads")
+                if existing_updated:
+                    parts.append(f"{existing_updated} existing updated")
                 app.client.chat_postMessage(
                     channel=bucket_ch,
-                    text=f"✅ *Catch-up scan complete* — processed {unassigned_count} unassigned + {assigned_count} assigned ticket(s).",
+                    text=f"✅ *Catch-up scan complete* — processed {' + '.join(parts)}.",
                 )
-            logger.info("Catch-up scan complete — %d unassigned + %d assigned", unassigned_count, assigned_count)
+            logger.info("Catch-up scan complete — %d unassigned + %d new + %d updated", unassigned_count, assigned_count, existing_updated)
 
         except Exception as e:
             logger.exception("Catch-up scan failed: %s", e)
