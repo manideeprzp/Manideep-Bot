@@ -1,0 +1,6 @@
+src/manideep_bot/app.py
+  39b93f8a-0554-4c76-be4f-0867ce3aeb1a:2026-05-04T06:10:36.166Z 339,342-354,356-357,359-363,365-368,370-373,375-379,381-385,387-388,390-404,406-411,413-423,425-427,429-449,451-452,454,558-561,563,565,568-573,575-581,583-585,587-599,601-603,605-616,618-625,627-628,779-785,1101-1122,1481-1482,1655-1656,1692-1693,1695,1712-1715,1717,1719,1754-1755,1764,1766,1768,1770-1775,1781,1785,1788-1794,1797,1799
+src/manideep_bot/bucket.py
+  39b93f8a-0554-4c76-be4f-0867ce3aeb1a:2026-05-04T06:03:05.901Z 6,10,91-93,96-103,106,110-112,130-135
+---
+{"schema_version": "authorship/3.0.0", "base_commit_sha": "HEAD~1", "prompts": {"39b93f8a-0554-4c76-be4f-0867ce3aeb1a:2026-05-04T06:10:36.166Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "karalapati.manideep@razorpay.com", "accepted_lines": 224, "overriden_lines": 0}, "39b93f8a-0554-4c76-be4f-0867ce3aeb1a:2026-05-04T06:03:05.901Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "karalapati.manideep@razorpay.com", "accepted_lines": 23, "overriden_lines": 0}}}
