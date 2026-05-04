@@ -1,0 +1,4 @@
+src/manideep_bot/app.py
+  39b93f8a-0554-4c76-be4f-0867ce3aeb1a:2026-05-04T06:24:57.739Z 1068,1072,1074-1095
+---
+{"schema_version": "authorship/3.0.0", "base_commit_sha": "HEAD~1", "prompts": {"39b93f8a-0554-4c76-be4f-0867ce3aeb1a:2026-05-04T06:24:57.739Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "karalapati.manideep@razorpay.com", "accepted_lines": 24, "overriden_lines": 0}}}
