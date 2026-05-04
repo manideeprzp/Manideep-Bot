@@ -1065,14 +1065,37 @@ def run_slack_bot():
 
         logger.info("[MSG] cmd=%r step=%r is_bucket=%s", cmd, state.get("step"), is_bucket)
         if cmd == "yes" and state.get("step") == "suggested":
-            logger.info("[MSG] >>> Running skill for 'yes': skill=%s", state.get("skill_name"))
+            logger.info("[MSG] >>> Running skill for 'yes': skill=%s display_id=%s", state.get("skill_name"), state.get("display_id"))
             from . import skill_runner
             ticket_text = state.get("ticket_text") or ""
             skill_name = (state.get("skill_name") or "").strip()
+            display_id = state.get("display_id") or ""
+
+            # If display_id or skill_name missing, recover from thread history
+            if not display_id or not skill_name or skill_name == "none":
+                try:
+                    history = client.conversations_replies(channel=ch, ts=thread_ts, limit=20)
+                    for msg in (history.get("messages") or []):
+                        msg_text = msg.get("text", "")
+                        for att in msg.get("attachments", []):
+                            msg_text += "\n" + (att.get("text", "") or "") + "\n" + (att.get("fallback", "") or "")
+                        if not display_id:
+                            _d = _parse_work_id(msg_text)
+                            if _d:
+                                display_id = _d
+                                state["display_id"] = display_id
+                        if not skill_name or skill_name == "none":
+                            _s = _parse_skill_name(msg_text)
+                            if _s and _s != "none":
+                                skill_name = _s
+                                state["skill_name"] = skill_name
+                    if display_id or skill_name:
+                        logger.info("Recovered from thread history: display_id=%s skill=%s", display_id, skill_name)
+                except Exception as _re:
+                    logger.warning("Thread history recovery failed: %s", _re)
 
             # Recover skill from response file if still "none"
             if not skill_name or skill_name == "none":
-                display_id = state.get("display_id") or ""
                 if display_id:
                     import pathlib
                     _data_root = pathlib.Path(__file__).resolve().parents[3] / "data"
@@ -1099,7 +1122,6 @@ def run_slack_bot():
                     skill_name = _sk or "none"
 
             # If ticket_text is empty/short, fetch from DevRev before running skill
-            display_id = state.get("display_id") or ""
             if len(ticket_text) < 50 and display_id:
                 try:
                     from . import devrev_client as _dc
